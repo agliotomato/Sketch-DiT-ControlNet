@@ -333,7 +333,7 @@ class Trainer:
 
             # Cast inputs to bfloat16 for model forward passes
             noisy_latents = noisy_latents.to(dtype=torch.bfloat16)
-            sigmas_1d = sigmas.view(B)   # (B,) for transformer timestep
+            sigmas_1d = sigmas.view(B).to(dtype=torch.bfloat16)  # (B,) transformer expects bf16
 
             # 5. ControlNet forward → block_samples + null conditioning
             block_samples, null_enc_hs, null_pooled = self.controlnet(
@@ -409,7 +409,7 @@ class Trainer:
             matte_latent = resize_matte_to_latent(matte)
 
             noisy_latents = noisy_latents.to(dtype=torch.bfloat16)
-            sigmas_1d = sigmas.view(B)
+            sigmas_1d = sigmas.view(B).to(dtype=torch.bfloat16)
 
             block_samples, null_enc_hs, null_pooled = self.controlnet(
                 noisy_latent=noisy_latents,
