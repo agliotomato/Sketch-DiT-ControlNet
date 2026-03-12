@@ -99,6 +99,7 @@ class HairControlNet(nn.Module):
             transformer,
             num_layers=num_layers,
             load_weights_from_transformer=True,
+            extra_conditioning_channels=0,  # ctrl_cond is 16ch (sketch_latent + matte_feat)
         )
         # Free transformer memory — it's held separately in Trainer
         del transformer
