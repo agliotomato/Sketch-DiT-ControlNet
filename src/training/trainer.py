@@ -247,7 +247,7 @@ class Trainer:
         u = torch.sigmoid(u)  # [0, 1]
         # Map to scheduler sigma values
         indices = (u * n_train).long().clamp(0, n_train - 1)
-        sigmas = self.scheduler.sigmas[indices].to(device=device)  # (B,)
+        sigmas = self.scheduler.sigmas[indices.cpu()].to(device=device)  # (B,)
         return sigmas.view(bsz, 1, 1, 1)
 
     # ------------------------------------------------------------------
