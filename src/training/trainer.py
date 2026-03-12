@@ -342,6 +342,11 @@ class Trainer:
                 matte=matte,
                 sigmas=sigmas_1d,
             )
+            # Accelerator's convert_to_fp32 converts controlnet outputs to fp32.
+            # Cast back to bf16 so the frozen bf16 transformer can consume them.
+            block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
+            null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
+            null_pooled   = null_pooled.to(dtype=torch.bfloat16)
 
             # 6. Frozen transformer forward with ControlNet residuals
             # NOTE: do NOT use torch.no_grad() here.
@@ -417,6 +422,9 @@ class Trainer:
                 matte=matte,
                 sigmas=sigmas_1d,
             )
+            block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
+            null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
+            null_pooled   = null_pooled.to(dtype=torch.bfloat16)
 
             v_pred = self.transformer(
                 hidden_states=noisy_latents,
