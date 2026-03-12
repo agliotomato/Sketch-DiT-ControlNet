@@ -4,7 +4,8 @@ model:
 
 training:
   mixed_precision: bf16  # SD3.5 works better with bf16 on A100/H100
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false  # H100 80GB: VRAM 충분, checkpointing 불필요
   gradient_clip: 1.0
   ema_decay: 0.9999
   weighting_scheme: logit_normal  # flow matching timestep sampling

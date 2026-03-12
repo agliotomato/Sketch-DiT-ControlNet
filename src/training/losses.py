@@ -217,10 +217,12 @@ class HairLoss(nn.Module):
         )
 
         if lpips_active and vae is not None and x_t is not None and sigmas is not None:
-            with torch.no_grad():
-                # Flow matching x0 recovery: x0 = x_t - sigma * v_pred
-                x0_pred = x_t - sigmas * v_pred
-                pred_rgb_11 = vae.decode(x0_pred)   # (B, 3, H, W) in [-1, 1]
+            # Flow matching x0 recovery: x0 = x_t - sigma * v_pred
+            # x0_pred must stay in the computation graph so LPIPS gradient
+            # flows back through v_pred → HairControlNet.
+            # VAE params are frozen (requires_grad=False) so no VAE updates occur.
+            x0_pred = x_t - sigmas * v_pred            # (B, 16, 64, 64)
+            pred_rgb_11 = vae.decode(x0_pred)          # (B, 3, H, W) in [-1, 1]
 
             if target_rgb is not None and matte is not None:
                 target_rgb_11 = VAEWrapper.normalize(target_rgb)

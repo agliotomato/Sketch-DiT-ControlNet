@@ -137,6 +137,12 @@ class Trainer:
             local_files_only=local_files_only,
         )
 
+        # Gradient checkpointing: saves ~40% activation memory at ~20% compute cost
+        # Recommended for A100 40GB to prevent OOM
+        if cfg["training"].get("gradient_checkpointing", True):
+            self.transformer.enable_gradient_checkpointing()
+            self.controlnet.controlnet.enable_gradient_checkpointing()
+
         # Flow matching scheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model_id,
@@ -338,15 +344,18 @@ class Trainer:
             )
 
             # 6. Frozen transformer forward with ControlNet residuals
-            with torch.no_grad():
-                v_pred = self.transformer(
-                    hidden_states=noisy_latents,
-                    encoder_hidden_states=null_enc_hs,
-                    pooled_projections=null_pooled,
-                    timestep=sigmas_1d,
-                    block_controlnet_hidden_states=block_samples,
-                    return_dict=False,
-                )[0]   # (B, 16, 64, 64)
+            # NOTE: do NOT use torch.no_grad() here.
+            # Transformer parameters are frozen via requires_grad_(False),
+            # but the computation graph must be maintained so that gradients
+            # flow back through block_controlnet_hidden_states → HairControlNet.
+            v_pred = self.transformer(
+                hidden_states=noisy_latents,
+                encoder_hidden_states=null_enc_hs,
+                pooled_projections=null_pooled,
+                timestep=sigmas_1d,
+                block_controlnet_hidden_states=block_samples,
+                return_dict=False,
+            )[0]   # (B, 16, 64, 64)
 
             # 7. Flow matching velocity target: v = noise - latents
             v_target = (noise - latents).to(dtype=torch.bfloat16)

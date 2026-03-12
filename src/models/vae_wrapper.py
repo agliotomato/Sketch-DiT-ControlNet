@@ -77,10 +77,14 @@ class VAEWrapper(nn.Module):
         latent = (raw_latent - self.shift_factor) * self.scaling_factor
         return latent
 
-    @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """
         Decode latent to image space.
+
+        NOTE: @torch.no_grad() intentionally omitted.
+        VAE parameters are frozen (requires_grad=False), so they are not updated.
+        But the computation graph must be maintained so that LPIPS gradients can
+        flow back: L_lpips → pred_rgb → VAE decode → x0_pred → v_pred → HairControlNet.
 
         Args:
             latent: (B, 16, H/8, W/8) in scaled space

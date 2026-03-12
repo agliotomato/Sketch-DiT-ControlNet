@@ -7,7 +7,7 @@ training:
   phase: pretrain
   dataset: unbraid          # loads unbraid_{train,test}
   epochs: 200
-  batch_size: 4             # SD3.5 is larger; reduced from original
+  batch_size: 8             # H100 80GB 기준
   learning_rate: 1.0e-4
   warmup_steps: 500
 
