@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 from diffusers import SD3ControlNetModel, SD3Transformer2DModel
 
+import torch.nn.functional as F
+
 from src.models.vae_wrapper import VAEWrapper
 
 
@@ -99,7 +101,10 @@ class HairControlNet(nn.Module):
             transformer,
             num_layers=num_layers,
             load_weights_from_transformer=True,
-            extra_conditioning_channels=0,  # ctrl_cond is 16ch (sketch_latent + matte_feat)
+            # SD3ControlNetModel defaults to extra_conditioning_channels=1,
+            # so pos_embed_input expects 17ch. We provide 17ch ctrl_cond:
+            #   16ch: sketch_latent + matte_feat
+            #    1ch: raw matte_latent (explicit spatial mask)
         )
         # Free transformer memory — it's held separately in Trainer
         del transformer
@@ -148,8 +153,13 @@ class HairControlNet(nn.Module):
         # 2. Encode matte through trainable CNN → latent-resolution features
         matte_feat = self.matte_cnn(matte.to(device=device, dtype=dtype))  # (B, 16, 64, 64)
 
-        # 3. Combine into control conditioning
-        ctrl_cond = sketch_latent + matte_feat  # (B, 16, 64, 64)
+        # 3. Combine into control conditioning (17ch for SD3ControlNetModel API)
+        #    16ch: sketch_latent + matte_feat  (structural + matte learned features)
+        #     1ch: raw matte downsampled       (explicit spatial mask)
+        matte_latent = F.interpolate(
+            matte.to(device=device, dtype=dtype), size=(64, 64), mode="bilinear", align_corners=False
+        )  # (B, 1, 64, 64)
+        ctrl_cond = torch.cat([sketch_latent + matte_feat, matte_latent], dim=1)  # (B, 17, 64, 64)
 
         # 4. Expand null embeddings to batch size
         null_enc_hs = self.null_encoder_hidden_states.expand(B, -1, -1).to(device=device, dtype=dtype)
