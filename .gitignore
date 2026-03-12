@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Dataset (too large for git)
+dataset3/
+
+# Checkpoints
+checkpoints/
+
+# Logs
+runs/
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# HuggingFace cache
+.cache/
+
+# Claude internal
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

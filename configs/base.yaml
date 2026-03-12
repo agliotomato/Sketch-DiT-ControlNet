@@ -1,0 +1,21 @@
+model:
+  model_id: stabilityai/stable-diffusion-3.5-medium
+  num_controlnet_layers: 12  # how many SD3.5 transformer blocks to use in ControlNet
+
+training:
+  mixed_precision: bf16  # SD3.5 works better with bf16 on A100/H100
+  gradient_accumulation_steps: 2
+  gradient_clip: 1.0
+  ema_decay: 0.9999
+  weighting_scheme: logit_normal  # flow matching timestep sampling
+  logit_mean: 0.0
+  logit_std: 1.0
+
+  loss_weights:
+    flow: 1.0
+    lpips: 0.1
+    edge: 0.0
+
+checkpointing:
+  eval_every: 10
+  save_every: 20

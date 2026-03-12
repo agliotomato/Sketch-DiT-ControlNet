@@ -1,0 +1,23 @@
+# Phase 1: Unbraid Pretraining
+# Inherits from base.yaml (loaded and merged in scripts/train.py)
+
+base: configs/base.yaml
+
+training:
+  phase: pretrain
+  dataset: unbraid          # loads unbraid_{train,test}
+  epochs: 200
+  batch_size: 4             # SD3.5 is larger; reduced from original
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+
+  loss_weights:
+    flow: 1.0
+    lpips: 0.1
+    lpips_warmup_frac: 0.3  # activate LPIPS after 30% of steps
+    edge: 0.0               # no edge loss in phase 1
+
+checkpointing:
+  output_dir: checkpoints/phase1_unbraid/
+  eval_every: 10
+  save_every: 20

@@ -1,0 +1,25 @@
+# Phase 2: Braid Fine-tuning
+# Loads Phase 1 best checkpoint and fine-tunes on braid data.
+
+base: configs/base.yaml
+
+training:
+  phase: finetune
+  dataset: braid            # loads braid_{train,test}
+  resume_from: checkpoints/phase1_unbraid/best.pth
+
+  epochs: 100
+  batch_size: 4
+  learning_rate: 2.0e-5
+  warmup_steps: 100
+
+  loss_weights:
+    flow: 1.0
+    lpips: 0.1
+    lpips_warmup_frac: 0.0  # LPIPS active immediately (model has perceptual baseline)
+    edge: 0.05              # edge loss active for braid structure fidelity
+
+checkpointing:
+  output_dir: checkpoints/phase2_braid/
+  eval_every: 5
+  save_every: 10
