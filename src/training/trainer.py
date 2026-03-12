@@ -138,10 +138,11 @@ class Trainer:
         )
 
         # Gradient checkpointing: saves ~40% activation memory at ~20% compute cost
-        # Recommended for A100 40GB to prevent OOM
+        # Required when LPIPS is active: VAE decode computation graph adds significant memory
         if cfg["training"].get("gradient_checkpointing", True):
             self.transformer.enable_gradient_checkpointing()
             self.controlnet.controlnet.enable_gradient_checkpointing()
+            self.vae.vae.enable_gradient_checkpointing()
 
         # Flow matching scheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(

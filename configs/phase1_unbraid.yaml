@@ -6,7 +6,8 @@ base: configs/base.yaml
 training:
   phase: pretrain
   dataset: unbraid          # loads unbraid_{train,test}
-  epochs: 200
+  resume_from: checkpoints/phase1_unbraid/epoch_60.pth
+  epochs: 140               # 200 - 60 = 140 remaining epochs
   batch_size: 8             # H100 80GB 기준
   learning_rate: 1.0e-4
   warmup_steps: 500
