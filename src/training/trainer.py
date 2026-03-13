@@ -83,7 +83,7 @@ class Trainer:
             w_lpips=config["training"]["loss_weights"].get("lpips", 0.1),
             w_edge=config["training"]["loss_weights"].get("edge", 0.0),
             lpips_warmup_frac=config["training"]["loss_weights"].get("lpips_warmup_frac", 0.3),
-        )
+        ).to(self.accelerator.device)
 
         self.ema = EMAModel(
             self.accelerator.unwrap_model(self.controlnet),
