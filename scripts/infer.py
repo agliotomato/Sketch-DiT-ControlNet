@@ -1,133 +1,218 @@
 """
-Single-sample inference: (sketch + matte) → hair region image.
+Inference: (sketch + matte) → hair region image using HairControlNet + SD3.5.
+
+Saves [sketch | matte | generated | target] 4-panel grid for visual inspection.
 
 Usage:
-  python scripts/infer.py \\
-    --checkpoint checkpoints/phase2_braid/best.pth \\
-    --sketch path/to/sketch.png \\
-    --matte  path/to/matte.png \\
-    --output output/hair_region.png \\
-    --steps 50
+  python scripts/infer.py \
+    --config  configs/phase2_braid.yaml \
+    --checkpoint checkpoints/phase2_braid/best.pth \
+    --split   braid_test \
+    --num_samples 16 \
+    --num_steps   20 \
+    --output_dir  outputs/infer_braid
 """
 
 import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
+import yaml
 from PIL import Image
-from torchvision import transforms
-from torchvision.utils import save_image
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.models.dit import HairDiT
-from src.models.conditioning import ConditionEncoder
+from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
+
+from src.data.dataset import HairRegionDataset
+from src.models.controlnet_sd35 import HairControlNet
 from src.models.vae_wrapper import VAEWrapper
-from src.training.scheduler import DDPMScheduler
 
 
-def load_image(path: str, mode: str = "RGB", size: int = 512) -> torch.Tensor:
-    img = Image.open(path).convert(mode)
-    tf = transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-    ])
-    return tf(img).unsqueeze(0)  # (1, C, H, W)
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
+def deep_merge(base: dict, override: dict) -> dict:
+    result = base.copy()
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def load_config(config_path: str) -> dict:
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    base_path = cfg.pop("base", None)
+    if base_path:
+        with open(base_path) as f:
+            base_cfg = yaml.safe_load(f)
+        cfg = deep_merge(base_cfg, cfg)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def infer(
-    checkpoint_path: str,
-    sketch_path: str,
-    matte_path: str,
-    output_path: str,
-    num_steps: int = 50,
-    device: str = "cuda",
-    image_size: int = 512,
-):
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+def run_sampling(
+    controlnet: HairControlNet,
+    transformer: SD3Transformer2DModel,
+    vae: VAEWrapper,
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    sketch: torch.Tensor,   # (1, 3, 512, 512) [0,1]
+    matte: torch.Tensor,    # (1, 1, 512, 512) [0,1]
+    num_steps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Flow matching reverse sampling. Returns (1, 3, 512, 512) in [0, 1]."""
+    scheduler.set_timesteps(num_steps, device=device)
 
-    # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    cfg = ckpt.get("config", {})
-    model_cfg = cfg.get("model", {})
+    latents = torch.randn(1, 16, 64, 64, device=device, dtype=torch.bfloat16)
 
-    # Init models
-    vae = VAEWrapper.from_pretrained().to(device)
-    dit = HairDiT(
-        input_size=model_cfg.get("input_size", 64),
-        patch_size=model_cfg.get("patch_size", 2),
-        in_channels=model_cfg.get("in_channels", 4),
-        hidden_size=model_cfg.get("hidden_size", 512),
-        depth=model_cfg.get("depth", 12),
-        num_heads=model_cfg.get("num_heads", 8),
-    ).to(device)
-    cond_enc = ConditionEncoder(
-        vae=vae,
-        hidden_size=model_cfg.get("hidden_size", 512),
-    ).to(device)
+    for i, t in enumerate(tqdm(scheduler.timesteps, desc="steps", leave=False)):
+        sigma = scheduler.sigmas[i].to(device)
+        sigmas_1d = sigma.view(1).to(dtype=torch.bfloat16)
 
-    dit.load_state_dict(ckpt["dit"])
-    cond_enc.matte_cnn.load_state_dict(ckpt["matte_cnn"])
-    cond_enc.sketch_patch_embed.load_state_dict(ckpt["sketch_embed"])
-    dit.eval()
-    cond_enc.eval()
+        block_samples, null_enc_hs, null_pooled = controlnet(
+            noisy_latent=latents,
+            sketch=sketch.to(device=device, dtype=torch.bfloat16),
+            matte=matte.to(device=device, dtype=torch.bfloat16),
+            sigmas=sigmas_1d,
+        )
+        block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
+        null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
+        null_pooled   = null_pooled.to(dtype=torch.bfloat16)
 
-    # Load inputs
-    sketch = load_image(sketch_path, "RGB",  image_size).to(device)
-    matte  = load_image(matte_path,  "L",    image_size).to(device)
+        v_pred = transformer(
+            hidden_states=latents,
+            encoder_hidden_states=null_enc_hs,
+            pooled_projections=null_pooled,
+            timestep=sigmas_1d,
+            block_controlnet_hidden_states=block_samples,
+            return_dict=False,
+        )[0]
 
-    # Encode conditions
-    sketch_tokens, matte_feat = cond_enc(sketch, matte)
+        latents = scheduler.step(v_pred, t, latents, return_dict=False)[0]
 
-    # DDPM sampling
-    scheduler = DDPMScheduler(num_timesteps=1000).to(device)
-    latent_size = image_size // 8  # 64
+    image = vae.decode(latents)                     # (1, 3, 512, 512) in [-1, 1]
+    image = (image.float().clamp(-1, 1) + 1) / 2   # [0, 1]
+    return image
 
-    x = torch.randn(1, 4, latent_size, latent_size, device=device)
 
-    # Use subset of timesteps for faster inference
-    T = scheduler.num_timesteps
-    step_indices = torch.linspace(T - 1, 0, num_steps, dtype=torch.long, device=device)
+# ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
 
-    for t_val in step_indices:
-        t_batch = t_val.expand(1)
-        noise_pred = dit(x, matte_feat, t_batch, sketch_tokens)
-        x = scheduler.sample_step(x, noise_pred, t_batch, eta=1.0)
+def to_uint8(t: torch.Tensor) -> np.ndarray:
+    """(1, C, H, W) [0,1] tensor → (H, W, 3) uint8."""
+    t = t.squeeze(0).float().cpu()
+    if t.shape[0] == 1:
+        t = t.repeat(3, 1, 1)
+    return (t.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
 
-    # Decode
-    hair_region_11 = vae.decode(x)            # (1, 3, 512, 512) [-1, 1]
-    hair_region_01 = VAEWrapper.denormalize(hair_region_11).clamp(0, 1)
 
-    # Apply matte mask
-    hair_region_01 = hair_region_01 * matte
+def make_panel(sketch, matte, gen, target) -> np.ndarray:
+    """Concatenate 4 images horizontally into one row."""
+    return np.concatenate([
+        to_uint8(sketch),
+        to_uint8(matte),
+        to_uint8(gen),
+        to_uint8(target),
+    ], axis=1)  # (512, 2048, 3)
 
-    # Save
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    save_image(hair_region_01, output_path)
-    print(f"Saved: {output_path}")
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--sketch",     required=True)
-    parser.add_argument("--matte",      required=True)
-    parser.add_argument("--output",     default="output/hair_region.png")
-    parser.add_argument("--steps",      type=int, default=50)
-    parser.add_argument("--device",     default="cuda")
+    parser.add_argument("--config",      required=True)
+    parser.add_argument("--checkpoint",  required=True)
+    parser.add_argument("--split",       default="braid_test")
+    parser.add_argument("--num_samples", type=int, default=16)
+    parser.add_argument("--num_steps",   type=int, default=20)
+    parser.add_argument("--output_dir",  default="outputs/infer")
     args = parser.parse_args()
 
-    infer(
-        checkpoint_path=args.checkpoint,
-        sketch_path=args.sketch,
-        matte_path=args.matte,
-        output_path=args.output,
-        num_steps=args.steps,
-        device=args.device,
+    cfg = load_config(args.config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_id = cfg["model"]["model_id"]
+    local_files_only = cfg.get("local_files_only", False)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Loading VAE...")
+    vae = VAEWrapper.from_pretrained(
+        model_id=model_id,
+        torch_dtype=torch.bfloat16,
+        local_files_only=local_files_only,
+    ).to(device).eval()
+
+    print("Loading Transformer...")
+    transformer = SD3Transformer2DModel.from_pretrained(
+        model_id,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+        local_files_only=local_files_only,
+    ).to(device).eval()
+
+    print("Loading ControlNet + checkpoint...")
+    controlnet = HairControlNet(
+        model_id=model_id,
+        vae=vae,
+        num_layers=cfg["model"].get("num_controlnet_layers", 12),
+        local_files_only=local_files_only,
     )
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    controlnet.load_state_dict(ckpt["controlnet"])
+    controlnet = controlnet.to(device).eval()
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", local_files_only=local_files_only,
+    )
+
+    print(f"Dataset: {args.split}")
+    dataset = HairRegionDataset(split=args.split)
+    n = min(args.num_samples, len(dataset))
+
+    rows = []
+    for idx in tqdm(range(n), desc="Generating"):
+        data   = dataset[idx]
+        sketch = data["sketch"].unsqueeze(0)
+        matte  = data["matte"].unsqueeze(0)
+        target = data["target"].unsqueeze(0)
+
+        gen = run_sampling(
+            controlnet=controlnet,
+            transformer=transformer,
+            vae=vae,
+            scheduler=scheduler,
+            sketch=sketch,
+            matte=matte,
+            num_steps=args.num_steps,
+            device=device,
+        )
+
+        # Save individual
+        Image.fromarray(to_uint8(gen.cpu())).save(output_dir / f"{idx:04d}_gen.png")
+
+        rows.append(make_panel(sketch, matte, gen.cpu(), target))
+
+    # Save grid (header label via blank row would need PIL draw, skip for simplicity)
+    grid = np.concatenate(rows, axis=0)
+    grid_path = output_dir / "grid.png"
+    Image.fromarray(grid).save(grid_path)
+    print(f"\nGrid saved: {grid_path}")
+    print(f"Columns: sketch | matte | generated | target")
 
 
 if __name__ == "__main__":
