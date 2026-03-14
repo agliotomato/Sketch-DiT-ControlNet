@@ -31,22 +31,22 @@
 
 | Sketch | Matte | Generated | Target |
 |--------|-------|-----------|--------|
-| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2534.png" width="256"/> | <img src="results/0000_gen.png" width="256"/> | <img src="results/0000_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2537.png" width="256"/> | <img src="results/0001_gen.png" width="256"/> | <img src="results/0001_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2539.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2548.png" width="256"/> | <img src="results/0003_gen.png" width="256"/> | <img src="results/0003_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2562.png" width="256"/> | <img src="results/0004_gen.png" width="256"/> | <img src="results/0004_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2572.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2572.png" width="256"/> | <img src="results/0005_gen.png" width="256"/> | <img src="results/0005_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2574.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2574.png" width="256"/> | <img src="results/0006_gen.png" width="256"/> | <img src="results/0006_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2576.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2576.png" width="256"/> | <img src="results/0007_gen.png" width="256"/> | <img src="results/0007_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2590.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2590.png" width="256"/> | <img src="results/0008_gen.png" width="256"/> | <img src="results/0008_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2592.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2592.png" width="256"/> | <img src="results/0009_gen.png" width="256"/> | <img src="results/0009_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2617.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2617.png" width="256"/> | <img src="results/0010_gen.png" width="256"/> | <img src="results/0010_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2625.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2625.png" width="256"/> | <img src="results/0011_gen.png" width="256"/> | <img src="results/0011_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2652.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2652.png" width="256"/> | <img src="results/0012_gen.png" width="256"/> | <img src="results/0012_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2653.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2653.png" width="256"/> | <img src="results/0013_gen.png" width="256"/> | <img src="results/0013_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2657.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2657.png" width="256"/> | <img src="results/0014_gen.png" width="256"/> | <img src="results/0014_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2676.png" width="256"/> | <img src="dataset3/braid/matte/test/braid_2676.png" width="256"/> | <img src="results/0015_gen.png" width="256"/> | <img src="results/0015_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2534.png" width="256"/> | <img src="results/0000_gen.png" width="256"/> | <img src="results/0000_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2537.png" width="256"/> | <img src="results/0001_gen.png" width="256"/> | <img src="results/0001_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2539.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2548.png" width="256"/> | <img src="results/0003_gen.png" width="256"/> | <img src="results/0003_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2562.png" width="256"/> | <img src="results/0004_gen.png" width="256"/> | <img src="results/0004_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2572.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2572.png" width="256"/> | <img src="results/0005_gen.png" width="256"/> | <img src="results/0005_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2574.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2574.png" width="256"/> | <img src="results/0006_gen.png" width="256"/> | <img src="results/0006_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2576.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2576.png" width="256"/> | <img src="results/0007_gen.png" width="256"/> | <img src="results/0007_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2590.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2590.png" width="256"/> | <img src="results/0008_gen.png" width="256"/> | <img src="results/0008_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2592.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2592.png" width="256"/> | <img src="results/0009_gen.png" width="256"/> | <img src="results/0009_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2617.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2617.png" width="256"/> | <img src="results/0010_gen.png" width="256"/> | <img src="results/0010_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2625.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2625.png" width="256"/> | <img src="results/0011_gen.png" width="256"/> | <img src="results/0011_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2652.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2652.png" width="256"/> | <img src="results/0012_gen.png" width="256"/> | <img src="results/0012_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2653.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2653.png" width="256"/> | <img src="results/0013_gen.png" width="256"/> | <img src="results/0013_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2657.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2657.png" width="256"/> | <img src="results/0014_gen.png" width="256"/> | <img src="results/0014_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2676.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2676.png" width="256"/> | <img src="results/0015_gen.png" width="256"/> | <img src="results/0015_target.png" width="256"/> |
 
 ---
 
