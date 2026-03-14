@@ -48,22 +48,10 @@
 | <img src="dataset/braid/sketch/test/braid_2657.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2657.png" width="256"/> | <img src="results/0014_gen.png" width="256"/> | <img src="results/0014_target.png" width="256"/> |
 | <img src="dataset/braid/sketch/test/braid_2676.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2676.png" width="256"/> | <img src="results/0015_gen.png" width="256"/> | <img src="results/0015_target.png" width="256"/> |
 
----
-
-## 정성적 평가
-
-| 평가 항목 | 관찰 결과 |
-|---|---|
-| Sketch 구조 추종 | **양호** — 땋임 패턴(교차, 방향)을 sketch 선 구조에 맞게 생성 |
-| Matte 경계 준수 | 생성된 머리카락이 matte 영역 내에 위치 |
-| 색감/질감 일치 | 일부 샘플에서 target과 색감 차이 존재. sketch 색이 실제 머리색이 아닌 strand 구분자이므로 예상된 현상 |
-
-> 색감 불일치는 Step 3 (diffusion inpainting refinement) 단계에서 주변 얼굴/배경 색에 맞춰 보정 예정.
-
----
-
 ## 다음 단계
+- Step 3: diffusion inpainting refinement — 경계 자연스러운 블렌딩 
+ 
 
-- [ ] Step 2: `composite.py` — generated hair region + 원본 얼굴 합성
-- [ ] Step 3: diffusion inpainting refinement — 경계 자연스러운 블렌딩
-- [ ] 정량 평가: SHR / MCS / LPIPS / FID (matte crop 기준)
+
+
+
