@@ -1,6 +1,6 @@
 # Architecture: Sketch-DiT-ControlNet
 
-## Research Goal
+## 연구목표
 
 ```
 (colored sketch + matte) → hair region image
@@ -47,7 +47,7 @@ SketchHairSalon의 GAN-based S2I-Net을 SD3.5 ControlNet으로 교체.
 ### 1. SD3.5 VAE (Frozen)
 
 - **Model**: `stabilityai/stable-diffusion-3.5-medium`, subfolder `vae`
-- **Latent space**: 16ch (vs SD1.5의 4ch)
+- **Latent space**: 16ch
 - **Spatial compression**: 8x (512x512 → 64x64)
 - **Encoding formula**:
   ```
@@ -339,3 +339,4 @@ scripts/
   composite.py            # hair region → face image 합성
   check_dataset.py        # dataset triplet 검증
 ```
+ 
