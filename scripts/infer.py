@@ -174,7 +174,7 @@ def main():
     )
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     controlnet.load_state_dict(ckpt["controlnet"])
-    controlnet = controlnet.to(device).eval()
+    controlnet = controlnet.to(device=device, dtype=torch.bfloat16).eval()
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_id, subfolder="scheduler", local_files_only=local_files_only,
