@@ -53,7 +53,7 @@
 | <img src="dataset/braid/sketch/test/braid_2676.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2676.png" width="256"/> | <img src="results/0015_gen.png" width="256"/> | <img src="results/0015_target.png" width="256"/> |
 
 ## 다음 단계
-- Step 3: diffusion inpainting  — 경계 자연스러운 블렌딩
+- Step 3: diffusion inpaiㄴnting  — 경계 자연스러운 블렌딩
  
 
 

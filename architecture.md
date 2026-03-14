@@ -49,15 +49,9 @@ SketchHairSalon의 GAN-based S2I-Net을 SD3.5 ControlNet으로 교체.
 - **Model**: `stabilityai/stable-diffusion-3.5-medium`, subfolder `vae`
 - **Latent space**: 16ch
 - **Spatial compression**: 8x (512x512 → 64x64)
-- **Encoding formula**:
-  ```
-  latent = (raw_latent - shift_factor) * scaling_factor
-  shift_factor   = 0.0609
-  scaling_factor = 1.5305
-  ```
 - **역할**:
-  1. target 이미지 → latent 압축 (학습 supervision)
-  2. sketch → latent 압축 (ControlNet conditioning input)
+  1. target 이미지 → latent 압축
+  2. sketch → latent 압축 
 
 ---
 
@@ -82,9 +76,12 @@ Output: matte_feat (B, 16, 64, 64)
 
 **초기화**: `SD3ControlNetModel.from_transformer(transformer, num_layers=12)`
 - SD3.5-medium transformer의 첫 12개 블록 가중치를 복사
-- 각 블록의 output projection은 **0으로 초기화** (zero-init)
-  - 학습 초기: residual ≈ 0 → transformer에 영향 없음
-  - 학습하면서 점진적으로 sketch 방향으로 유도
+  - SD3.5는 이미 수십억 장으로 학습된 feature extractor → 랜덤 초기화 대비 빠르고 안정적
+- 각 블록의 output projection만 **0으로 초기화** (zero-init)
+  - Attention/FFN 내부는 SD3.5 가중치 유지 → feature 추출 능력 보존
+  - output projection = 0 → residual = 0 → 학습 초기엔 ControlNet이 없는 것과 동일
+  - frozen transformer 입력이 망가지지 않아 loss 폭발 없이 안정적으로 시작
+  - backprop이 돌면서 output projection이 0에서 서서히 커짐 → sketch 구조를 점진적으로 주입
 
 **입력 처리**:
 ```
@@ -125,16 +122,10 @@ combined
   - ControlNet residual 1개가 transformer 블록 2개 담당
   - 전체 24블록 모두 영향받음
 
-**Null text conditioning**:
-- 텍스트 조건 없음 → learned null embedding 사용
-- `null_encoder_hidden_states`: `nn.Parameter (1, 333, 4096)` — 학습됨
-- `null_pooled_projections`: `nn.Parameter (1, 2048)` — 학습됨
-
----
 
 ## Training: Phase 1 (Unbraid Pretrain)
 
-### Goal
+### 목표
 
 SD3.5 + ControlNet이 unbraid hair sketch를 따르는 hair region 생성 능력 획득.
 
@@ -155,56 +146,25 @@ SD3.5 + ControlNet이 unbraid hair sketch를 따르는 hair region 생성 능력
 Loss (v_pred vs v_target)
   ↓
 SD3.5 Transformer (frozen)
-  파라미터 업데이트: ❌
+  파라미터 업데이트: 없음
   하지만 residual 주입 연산을 통해 gradient는 통과:
     hidden_states += residuals[int(i / 2)]  ← 이 덧셈을 통해 역전파
   ↓
-HairControlNet (12 blocks) → ✅ 파라미터 업데이트
+HairControlNet (12 blocks) →  파라미터 업데이트
   ↓
 ctrl_cond = sketch_latent + matte_feat
-  ├── sketch_latent: frozen VAE 출력 → ❌ (gradient 없음)
-  └── matte_feat: MatteCNN 출력 → ✅
+  ├── sketch_latent: frozen VAE 출력 → gradient 없음
+  └── matte_feat: MatteCNN 출력 → 파라미터 업데이트
        ↓
-MatteCNN → ✅ 파라미터 업데이트
+MatteCNN →  파라미터 업데이트
 
-null_encoder_hidden_states (nn.Parameter) → ✅
-null_pooled_projections    (nn.Parameter) → ✅
+null_encoder_hidden_states (nn.Parameter) → 파라미터 업데이트
+null_pooled_projections    (nn.Parameter) → 파라미터 업데이트
 ```
-
-**핵심**: PyTorch는 frozen 모듈을 통과할 때 모듈 **파라미터**의 gradient는 계산하지 않지만,
-텐서 연산의 computation graph는 유지한다.
-따라서 `hidden_states += residuals[i]` 덧셈을 통해 gradient가 residuals까지 역전파되고,
-결과적으로 HairControlNet 파라미터가 업데이트된다.
-| null_encoder_hidden_states | 333 x 4096 | **Trainable** |
-| null_pooled_projections | 2048 | **Trainable** |
 
 ### Noise Schedule: Flow Matching
 
 SD3.5는 DDPM이 아닌 **Rectified Flow (Flow Matching)** 사용.
-
-**Forward process (noise 추가)**:
-```
-x_t = (1 - sigma) * x_0 + sigma * noise
-
-sigma in [0, 1]:  sigma=0 → clean,  sigma=1 → pure noise
-```
-
-**Model prediction target (velocity)**:
-```
-v_target = noise - x_0
-```
-
-**x_0 복원** (LPIPS loss 계산용):
-```
-x_0_pred = x_t - sigma * v_pred
-```
-
-**Timestep sampling**: Logit-Normal distribution
-```python
-u = sigmoid(Normal(mean=0.0, std=1.0))   # [0, 1]
-sigma = scheduler.sigmas[int(u * T)]
-```
-uniform보다 중간 sigma 구간에 샘플 집중 → 구조 학습에 유리.
 
 ### Training Step
 
@@ -239,103 +199,11 @@ uniform보다 중간 sigma 구간에 샘플 집중 → 구조 학습에 유리.
 ⑦ Loss 계산 → Backward → optimizer step (ControlNet만)
 ```
 
-### Loss Function
-
-```
-L_total = L_flow + w_lpips * L_lpips
-
-L_flow (항상 활성):
-  diff   = (v_pred - v_target)^2              # (B, 16, 64, 64)
-  weight = matte_latent * 1.0
-         + (1 - matte_latent) * 0.1           # 외부 영역 gradient 억제
-  L_flow = mean(weight * diff)
-
-L_lpips (steps의 30% 이후 활성):
-  x0_pred  = x_t - sigma * v_pred             # flow matching x0 복원
-  pred_rgb = VAE.decode(x0_pred)              # (B, 3, 512, 512)
-  L_lpips  = LPIPS_VGG(pred_rgb * matte, target * matte)
-
-w_lpips = 0.1
-L_edge  = 0.0  (Phase 1 비활성)
-```
-
-**matte weighting 이유**: 배경(검정)은 trivially easy → gradient가 머리 영역에 집중되어야 함.
-
-**LPIPS warmup 이유**: 초기에는 velocity 학습을 먼저 안정화, 이후 pixel-level 품질 추가.
-
-### Optimizer & Schedule
-
-```
-Optimizer:  AdamW (beta1=0.9, beta2=0.999, weight_decay=1e-2)
-LR:         1e-4, cosine decay to 1e-6
-Warmup:     500 steps (linear)
-Mixed prec: bf16
-Grad accum: 2 steps
-Grad clip:  1.0
-EMA decay:  0.9999 (HairControlNet에만 적용)
-Epochs:     200
-Batch size: 4
-```
-
 ### Data Augmentation (Phase 1)
 
 | Augmentation | 확률 | 역할 |
 |---|---|---|
 | SketchColorJitter | p=0.8 | 색에 과적합 방지 — color = structural cue로 학습 |
-| ThicknessJitter (dilation) | p=0.5 | 선 두께 변화에 robust |
-| MattePerturbation (elastic) | p=0.3 | 경계 흔들림에 robust |
+| ThicknessJitter (dilation) | p=0.5 | 선 두께 변화에 강건 |
+| MattePerturbation (elastic) | p=0.3 | 경계 흔들림에 강건 |
 | AppearanceJitter | p=0.5 | 구조-외관 분리 (target에만 적용) |
-
-Phase 2에서는 braid topology 보존을 위해 각 확률 낮춤.
-
-### Evaluation Metrics (Phase 1)
-
-| Metric | 측정 대상 |
-|---|---|
-| **SHR** (Sketch Hit Rate) | 스케치 선 위치에 생성 이미지의 edge가 존재하는가 |
-| **MCS** (Matte Coverage Score) | 생성된 머리가 matte 영역 안에 있는가 |
-| **LPIPS** | matte 내부 시각적 품질 |
-
----
-
-## Training: Phase 2 (Braid Finetune)
-
-Phase 1 완료 후 braid 데이터 (1K)로 fine-tune.
-
-- Phase 1 checkpoint 로드 (`checkpoints/phase1_unbraid/best.pth`)
-- LR 5x 낮춤 (2e-5) → unbraid prior 보존
-- Edge loss 활성화 (w=0.05) → braid 구조 fidelity 강화
-- Augmentation 강도 낮춤 → braid topology correspondence 보존
-- 추가 metric: **BSS** (Braid Structure Score) — strand crossing 재현도
-
----
-
-## File Structure
-
-```
-src/
-  models/
-    vae_wrapper.py        # SD3.5 VAE (16ch, frozen)
-    controlnet_sd35.py    # HairControlNet + MatteCNN
-  data/
-    dataset.py            # HairRegionDataset (sketch, matte, target triplets)
-    augmentation.py       # 4종 augmentation pipeline
-    utils.py              # soft_composite, resize_matte_to_latent
-  training/
-    trainer.py            # Unified trainer (Phase 1 & 2)
-    losses.py             # FlowMatchingLoss + PerceptualLoss + SketchEdgeAlignmentLoss
-    ema.py                # EMA for HairControlNet
-
-configs/
-  base.yaml               # 공통 설정 (model_id, mixed_precision 등)
-  phase1_unbraid.yaml     # Phase 1 config
-  phase2_braid.yaml       # Phase 2 config
-
-scripts/
-  train.py                # python scripts/train.py --config configs/phase1_unbraid.yaml
-  evaluate.py             # SHR, MCS, LPIPS, BSS
-  infer.py                # single sample inference
-  composite.py            # hair region → face image 합성
-  check_dataset.py        # dataset triplet 검증
-```
- 
