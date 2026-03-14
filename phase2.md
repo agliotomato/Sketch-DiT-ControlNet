@@ -8,7 +8,7 @@
 | Phase 1 체크포인트 | `checkpoints/phase1_unbraid/epoch_40.pth` |
 | 데이터셋 | braid_train (1,000샘플) |
 | Epochs | 100 |
-| Batch size | 8 |S
+| Batch size | 8 |
 | Learning rate | 2e-5 |
 | Loss | Flow matching + LPIPS (즉시 활성화) + Edge alignment (w=0.05) |
 | 최종 avg loss | 0.0105 |
