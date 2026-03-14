@@ -8,7 +8,7 @@
 | Phase 1 체크포인트 | `checkpoints/phase1_unbraid/epoch_40.pth` |
 | 데이터셋 | braid_train (1,000샘플) |
 | Epochs | 100 |
-| Batch size | 8 |
+| Batch size | 8 |S
 | Learning rate | 2e-5 |
 | Loss | Flow matching + LPIPS (즉시 활성화) + Edge alignment (w=0.05) |
 | 최종 avg loss | 0.0105 |
@@ -20,10 +20,10 @@
 
 | 열 | 이름 | 설명 |
 |---|---|---|
-| 1열 | **Sketch** | 입력 컬러 스케치. 색은 strand 구분자(appearance 아님). 땋임 패턴, 선 방향, 교차 구조 포함 |
+| 1열 | **Sketch** | 입력 컬러 스케치. 색은 strand 구분용(땋임 패턴, 선방향, 교차 구조 포함) |
 | 2열 | **Matte** | 입력 soft alpha matte. 머리카락 영역(0~1). 모델이 생성 범위를 이 영역으로 제한 |
 | 3열 | **Generated** | 모델 출력. sketch + matte를 조건으로 flow matching 20스텝 denoising하여 생성한 hair region |
-| 4열 | **Target** | 정답. 원본 사진에서 `img × matte`로 추출한 실제 머리카락 영역 |
+| 4열 | **Target** | Ground Truth. 원본 사진에서 `img × matte`로 추출한 실제 머리카락 영역 |
 
 ---
 

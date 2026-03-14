@@ -42,7 +42,7 @@ SketchHairSalon의 GAN-based S2I-Net을 SD3.5 ControlNet으로 교체.
 
 ---
 
-## Component Details
+## 구성.
 
 ### 1. SD3.5 VAE (Frozen)
 
@@ -55,7 +55,7 @@ SketchHairSalon의 GAN-based S2I-Net을 SD3.5 ControlNet으로 교체.
   shift_factor   = 0.0609
   scaling_factor = 1.5305
   ```
-- **역할 (이중)**:
+- **역할**:
   1. target 이미지 → latent 압축 (학습 supervision)
   2. sketch → latent 압축 (ControlNet conditioning input)
 
@@ -73,7 +73,6 @@ Conv2d(32→16, k=3, s=2, p=1) + GroupNorm(4)  + SiLU   # 128→64
 Output: matte_feat (B, 16, 64, 64)
 ```
 
-- **파라미터 수**: ~100K
 - **역할**: "어느 공간 영역에 머리카락을 생성할 것인가"를 16ch latent 공간 신호로 변환
 - sketch_latent와 add 후 ctrl_cond로 사용
 
@@ -85,7 +84,7 @@ Output: matte_feat (B, 16, 64, 64)
 - SD3.5-medium transformer의 첫 12개 블록 가중치를 복사
 - 각 블록의 output projection은 **0으로 초기화** (zero-init)
   - 학습 초기: residual ≈ 0 → transformer에 영향 없음
-  - 학습하면서 점진적으로 sketch 방향으로 조향
+  - 학습하면서 점진적으로 sketch 방향으로 유도
 
 **입력 처리**:
 ```
