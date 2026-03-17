@@ -5,102 +5,103 @@ All augmentations operate on the sample dict:
   {sketch, matte, target, img, filename}
 
 Key design constraints:
-  - SketchColorJitter: per-unique-color remapping (NOT global ColorJitter)
+  - StrokeColorSampler: per-stroke color sampling from actual target hair pixels
+    (follows SketchHairSalon paper: each iteration samples a random pixel from
+     the corresponding target region → color correspondence is maintained)
   - MatteBoundaryPerturbation: recomputes target after matte warp
-  - AppearanceJitter: applied to target only, NOT sketch
 """
 
 from __future__ import annotations
 
 import random
-from typing import Optional
 
 import kornia.filters as KF
-import kornia.geometry.transform as KGT
 import kornia.morphology as KM
 import torch
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 
 from .utils import soft_composite
 
 
 # ---------------------------------------------------------------------------
-# 1. Sketch Color Jitter
+# 1. Stroke Color Sampler  (SketchHairSalon 방식)
 # ---------------------------------------------------------------------------
 
-class SketchColorJitter:
+class StrokeColorSampler:
     """
-    Per-unique-color random hue remapping for colored sketches.
+    Per-stroke color sampling from actual target hair pixels.
 
-    Rationale: sketch color = strand structural identifier, NOT appearance.
-    Each unique color in the sketch is remapped to a new random color.
-    Spatial structure (which pixel belongs to which strand) is preserved.
+    SketchHairSalon 논문 방식:
+      각 stroke 영역에 대해, 매 iteration마다 target 이미지의 해당 위치 픽셀 중
+      무작위로 1개를 샘플링하여 stroke 색으로 할당.
+
+    효과:
+      - 색 대응 유지: stroke 색 ∈ 실제 머리 색 범위 → 모델이 색 correspondence 학습
+      - 데이터 증강: 같은 구조라도 매 iteration 색이 미세하게 달라져 다양성 확보
 
     Args:
-        p: probability of applying augmentation
-        min_colors: skip aug if sketch has fewer unique colors (nearly blank)
+        p:              적용 확률
+        min_pixels:     stroke 영역 픽셀 수가 이 값 미만이면 해당 stroke 색 유지
+        quantize_bits:  unique stroke 검출을 위한 양자화 비트 수
     """
 
-    def __init__(self, p: float = 0.8, min_colors: int = 3):
+    def __init__(self, p: float = 1.0, min_pixels: int = 10, quantize_bits: int = 5):
         self.p = p
-        self.min_colors = min_colors
+        self.min_pixels = min_pixels
+        self.shift = 8 - quantize_bits
 
     def __call__(self, sample: dict) -> dict:
         if random.random() > self.p:
             return sample
 
         sketch = sample["sketch"]  # (3, H, W) float32 [0,1]
-        sketch_aug = self._remap_colors(sketch)
-        sample = {**sample, "sketch": sketch_aug}
-        return sample
+        target = sample["target"]  # (3, H, W) float32 [0,1]  = img * matte
 
-    def _remap_colors(self, sketch: torch.Tensor) -> torch.Tensor:
-        """
-        Find unique colors (quantized to 8-bit), remap each to a random new color.
-        Preserves anti-aliasing / soft transitions via linear interpolation.
-        """
-        C, H, W = sketch.shape
-        # Quantize to uint8 for unique color detection
+        sketch_aug = self._resample_colors(sketch, target)
+        return {**sample, "sketch": sketch_aug}
+
+    def _resample_colors(self, sketch: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # uint8 양자화로 unique stroke 레이블 검출
         sketch_u8 = (sketch * 255).byte()  # (3, H, W)
-        flat = sketch_u8.view(3, -1).T      # (N, 3)
+        sketch_q  = (sketch_u8 >> self.shift) << self.shift  # quantized
 
-        # Find unique colors
-        unique_colors = torch.unique(flat, dim=0)  # (K, 3)
-        if len(unique_colors) < self.min_colors:
-            return sketch
+        flat_q = sketch_q.view(3, -1).T  # (N, 3)
+        unique_colors = torch.unique(flat_q, dim=0)  # (K, 3)
 
-        # Build color map: old → new
-        color_map: dict[tuple, torch.Tensor] = {}
+        out = sketch.clone()
+
         for color in unique_colors:
             r, g, b = color.tolist()
-            if r == 0 and g == 0 and b == 0:
-                # keep black background as-is
-                color_map[(r, g, b)] = torch.zeros(3)
-            else:
-                h = random.random()
-                s = random.uniform(0.5, 1.0)
-                v = random.uniform(0.5, 1.0)
-                new_color = torch.tensor(self._hsv_to_rgb(h, s, v))
-                color_map[(r, g, b)] = new_color
 
-        # Apply mapping pixel-by-pixel via vectorized operation
-        out = torch.zeros_like(sketch)
-        for color, new_color in color_map.items():
-            mask = (sketch_u8[0] == color[0]) & (sketch_u8[1] == color[1]) & (sketch_u8[2] == color[2])
-            out[:, mask] = new_color.unsqueeze(1)
+            # 검은 배경(non-hair stroke) 은 건드리지 않음
+            if r == 0 and g == 0 and b == 0:
+                continue
+
+            # 이 stroke 레이블에 해당하는 픽셀 마스크
+            mask = (
+                (sketch_q[0] == r) &
+                (sketch_q[1] == g) &
+                (sketch_q[2] == b)
+            )  # (H, W) bool
+
+            # target에서 이 stroke 위치의 실제 머리 픽셀 추출
+            hair_pixels = target[:, mask]  # (3, N)
+
+            # matte 내 유효한 픽셀만 (target이 0이 아닌 것)
+            valid = hair_pixels.sum(dim=0) > 0.05  # (N,)
+            if valid.sum() < self.min_pixels:
+                continue
+
+            hair_pixels_valid = hair_pixels[:, valid]  # (3, M)
+
+            # 무작위로 픽셀 1개 샘플링
+            idx = random.randint(0, hair_pixels_valid.shape[1] - 1)
+            sampled_color = hair_pixels_valid[:, idx]  # (3,)
+
+            # 해당 stroke 모든 픽셀을 sampled_color로 교체
+            out[:, mask] = sampled_color.unsqueeze(1)
 
         return out
-
-    @staticmethod
-    def _hsv_to_rgb(h: float, s: float, v: float) -> list[float]:
-        if s == 0.0:
-            return [v, v, v]
-        i = int(h * 6.0)
-        f = (h * 6.0) - i
-        p, q, t = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
-        i %= 6
-        return [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]][i]
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +126,10 @@ class ThicknessJitter:
             return sample
 
         sketch = sample["sketch"].unsqueeze(0)  # (1, 3, H, W)
-        k = random.choice([k for k in range(3, self.max_kernel + 1, 2)])  # 3 or max_kernel
+        k = random.choice([k for k in range(3, self.max_kernel + 1, 2)])
         kernel = torch.ones(k, k, device=sketch.device)
-        # Dilate: non-zero (stroke) pixels spread outward
         sketch_dilated = KM.dilation(sketch, kernel).squeeze(0)
-        sample = {**sample, "sketch": sketch_dilated.clamp(0, 1)}
-        return sample
+        return {**sample, "sketch": sketch_dilated.clamp(0, 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +160,11 @@ class MatteBoundaryPerturbation:
 
         H, W = matte.shape[-2], matte.shape[-1]
 
-        # Random displacement field
         noise = torch.randn(1, 2, H, W, device=matte.device) * self.amplitude
-        # Smooth displacement field with Gaussian blur
-        kernel_size = int(6 * self.sigma / H * H) | 1  # ensure odd
+        kernel_size = int(6 * self.sigma / H * H) | 1
         kernel_size = max(kernel_size, 3)
         noise = KF.gaussian_blur2d(noise, (kernel_size, kernel_size), (self.sigma, self.sigma))
 
-        # Build normalized displacement grid
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(-1, 1, H, device=matte.device),
             torch.linspace(-1, 1, W, device=matte.device),
@@ -176,80 +172,16 @@ class MatteBoundaryPerturbation:
         )
         grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # (1, H, W, 2)
 
-        # Scale noise to normalized coords
-        disp = noise.permute(0, 2, 3, 1)  # (1, H, W, 2)
+        disp = noise.permute(0, 2, 3, 1)
         disp[..., 0] /= (W / 2)
         disp[..., 1] /= (H / 2)
         grid_warped = (grid + disp).clamp(-1, 1)
 
-        # Warp matte
         matte_warped = F.grid_sample(matte.float(), grid_warped, mode="bilinear", align_corners=True)
-        matte_warped = matte_warped.squeeze(0).clamp(0, 1)  # (1, H, W)
+        matte_warped = matte_warped.squeeze(0).clamp(0, 1)
 
-        # Recompute target with warped matte
         target_warped = soft_composite(sample["img"], matte_warped)
-
-        sample = {**sample, "matte": matte_warped, "target": target_warped}
-        return sample
-
-
-# ---------------------------------------------------------------------------
-# 4. Appearance Jitter
-# ---------------------------------------------------------------------------
-
-class AppearanceJitter:
-    """
-    Randomly jitter brightness/contrast/saturation/hue of the target hair image.
-    Applied ONLY to target, NOT to sketch (structure-appearance separation).
-
-    Args:
-        p:          probability of applying augmentation
-        brightness: max ± brightness delta
-        contrast:   max ± contrast delta
-        saturation: max ± saturation delta
-        hue:        max ± hue delta
-    """
-
-    def __init__(
-        self,
-        p: float = 0.5,
-        brightness: float = 0.2,
-        contrast: float = 0.2,
-        saturation: float = 0.1,
-        hue: float = 0.05,
-    ):
-        self.p = p
-        self.brightness = brightness
-        self.contrast = contrast
-        self.saturation = saturation
-        self.hue = hue
-
-    def __call__(self, sample: dict) -> dict:
-        if random.random() > self.p:
-            return sample
-
-        target = sample["target"]  # (3, H, W) [0,1]
-        matte  = sample["matte"]   # (1, H, W) [0,1]
-
-        # Sample random factors
-        b = 1.0 + random.uniform(-self.brightness, self.brightness)
-        c = 1.0 + random.uniform(-self.contrast, self.contrast)
-        s = 1.0 + random.uniform(-self.saturation, self.saturation)
-        h = random.uniform(-self.hue, self.hue)
-
-        # Apply only to hair region (avoid changing black background)
-        # Temporarily extract hair pixels, jitter, recompose
-        target_jittered = TF.adjust_brightness(target, b)
-        target_jittered = TF.adjust_contrast(target_jittered, c)
-        target_jittered = TF.adjust_saturation(target_jittered, s)
-        target_jittered = TF.adjust_hue(target_jittered, h)
-        target_jittered = target_jittered.clamp(0, 1)
-
-        # Reapply matte mask (keep background black)
-        target_jittered = soft_composite(target_jittered, matte)
-
-        sample = {**sample, "target": target_jittered}
-        return sample
+        return {**sample, "matte": matte_warped, "target": target_warped}
 
 
 # ---------------------------------------------------------------------------
@@ -272,26 +204,24 @@ def build_augmentation_pipeline(phase: str = "pretrain") -> ComposeAug:
     """
     Build the augmentation pipeline for a given training phase.
 
+    StrokeColorSampler (p=1.0):
+      매 iteration마다 target 실제 픽셀을 샘플링하여 stroke 색 할당.
+      AppearanceJitter 제거: target 색을 흔들면 stroke↔target 색 대응이 깨짐.
+
     Args:
         phase: "pretrain" (unbraid) or "finetune" (braid)
-
-    Returns:
-        ComposeAug instance
     """
     if phase == "pretrain":
         return ComposeAug([
-            SketchColorJitter(p=0.8),
+            StrokeColorSampler(p=1.0),
             ThicknessJitter(p=0.5),
             MatteBoundaryPerturbation(p=0.3),
-            AppearanceJitter(p=0.5),
         ])
     elif phase == "finetune":
-        # Reduced augmentation intensity to preserve braid structure correspondence
         return ComposeAug([
-            SketchColorJitter(p=0.5),
+            StrokeColorSampler(p=1.0),
             ThicknessJitter(p=0.3),
             MatteBoundaryPerturbation(p=0.2),
-            AppearanceJitter(p=0.4),
         ])
     else:
         raise ValueError(f"Unknown phase: {phase}. Must be 'pretrain' or 'finetune'.")
