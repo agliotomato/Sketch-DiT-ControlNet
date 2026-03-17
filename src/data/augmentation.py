@@ -94,9 +94,12 @@ class StrokeColorSampler:
 
             hair_pixels_valid = hair_pixels[:, valid]  # (3, M)
 
-            # 무작위로 픽셀 1개 샘플링
-            idx = random.randint(0, hair_pixels_valid.shape[1] - 1)
-            sampled_color = hair_pixels_valid[:, idx]  # (3,)
+            # GAN 방식: 67% 평균 색상, 33% 랜덤 픽셀
+            if random.randint(0, 5) < 2:
+                idx = random.randint(0, hair_pixels_valid.shape[1] - 1)
+                sampled_color = hair_pixels_valid[:, idx]  # (3,)
+            else:
+                sampled_color = hair_pixels_valid.float().mean(dim=1)  # (3,)
 
             # 해당 stroke 모든 픽셀을 sampled_color로 교체
             out[:, mask] = sampled_color.unsqueeze(1)
