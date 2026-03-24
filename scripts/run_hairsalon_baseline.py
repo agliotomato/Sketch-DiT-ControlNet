@@ -75,23 +75,37 @@ def run_s2i(model, sk_matte: np.ndarray, img_rgb: np.ndarray, matte_gray: np.nda
     Returns:     (H,W,3) uint8  generated full image
     """
     H, W = img_rgb.shape[:2]
-    matte_3 = cv2.cvtColor(matte_gray, cv2.COLOR_GRAY2RGB)  # (H,W,3)
+    # 모델은 256×256만 처리
+    sk_matte_256 = cv2.resize(sk_matte, (256, 256), interpolation=cv2.INTER_LINEAR)
+    img_rgb_256  = cv2.resize(img_rgb,  (256, 256), interpolation=cv2.INTER_LINEAR)
+    matte_256    = cv2.resize(matte_gray, (256, 256), interpolation=cv2.INTER_LINEAR)
 
-    noise = generate_noise(W, H)
+    matte_3 = cv2.cvtColor(matte_256, cv2.COLOR_GRAY2RGB)
+
+    noise = generate_noise(256, 256)
 
     N  = tf.to_tensor(noise).unsqueeze(0).to(device)
     M  = tf.to_tensor(matte_3).unsqueeze(0).to(device)
-    SK = (tf.to_tensor(sk_matte) * 2.0 - 1.0).unsqueeze(0).to(device)
-    IM = (tf.to_tensor(img_rgb)  * 2.0 - 1.0).unsqueeze(0).to(device)
+    SK = (tf.to_tensor(sk_matte_256) * 2.0 - 1.0).unsqueeze(0).to(device)
+    IM = (tf.to_tensor(img_rgb_256)  * 2.0 - 1.0).unsqueeze(0).to(device)
 
-    out = model(SK, IM, M, N)  # (1,3,H,W) in [-1,1]
-    result = ((out[0] + 1) / 2 * 255).cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
+    out = model(SK, IM, M, N)  # (1,3,256,256) in [-1,1]
+    result_256 = ((out[0] + 1) / 2 * 255).cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
+    # 원래 크기로 복원
+    result = cv2.resize(result_256, (W, H), interpolation=cv2.INTER_LINEAR)
     return result
 
 
 def make_sk_matte(sketch_rgb: np.ndarray, img_rgb: np.ndarray, matte_gray: np.ndarray,
                   use_color_coding: bool) -> np.ndarray:
     """colored sketch를 matte background 위에 올린 sk_matte 생성."""
+    H, W = matte_gray.shape[:2]
+    # sketch/img 크기를 matte 크기에 맞춤 (color_coding이 같은 좌표계 가정)
+    if sketch_rgb.shape[:2] != (H, W):
+        sketch_rgb = cv2.resize(sketch_rgb, (W, H), interpolation=cv2.INTER_NEAREST)
+    if img_rgb.shape[:2] != (H, W):
+        img_rgb = cv2.resize(img_rgb, (W, H), interpolation=cv2.INTER_LINEAR)
+
     matte_3 = cv2.cvtColor(matte_gray, cv2.COLOR_GRAY2RGB)
     if use_color_coding:
         # 논문 원래 방식: grayscale stroke 값으로 구분 → target 픽셀 색으로 교체
@@ -106,7 +120,7 @@ def make_sk_matte(sketch_rgb: np.ndarray, img_rgb: np.ndarray, matte_gray: np.nd
 
 
 def process(style: str, subset: str, model, device, use_color_coding: bool,
-            max_samples: int = 0, save_input: bool = False):
+            max_samples: int = 0, save_input: bool = False, stem_filter: str = None):
     base = DATASET_ROOT / style
     img_dir    = base / "img"    / subset
     sketch_dir = base / "sketch" / subset
@@ -116,6 +130,8 @@ def process(style: str, subset: str, model, device, use_color_coding: bool,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stems = sorted(p.stem for p in img_dir.glob("*.png"))
+    if stem_filter:
+        stems = [s for s in stems if s == stem_filter]
     if max_samples > 0:
         stems = stems[:max_samples]
     print(f"\n{style}/{subset}: {len(stems)} samples → {out_dir}")
@@ -134,11 +150,13 @@ def process(style: str, subset: str, model, device, use_color_coding: bool,
         if save_input:
             Image.fromarray(sk_matte).save(out_dir / f"{stem}_sk.png")
 
-        if not out_path.exists():
+        if not out_path.exists() or save_input:
             full_img = run_s2i(model, sk_matte, img_rgb, matte_gray, device)
 
             # hair patch = full_img × matte
-            matte_f = matte_gray.astype(np.float32) / 255.0
+            H_out, W_out = full_img.shape[:2]
+            matte_out = cv2.resize(matte_gray, (W_out, H_out), interpolation=cv2.INTER_LINEAR)
+            matte_f = matte_out.astype(np.float32) / 255.0
             hair_patch = (full_img.astype(np.float32) * matte_f[..., None]).astype(np.uint8)
 
             Image.fromarray(hair_patch).save(out_path)
@@ -154,6 +172,8 @@ def main():
                         help="처리할 최대 샘플 수 (0=전체)")
     parser.add_argument("--save_input",  action="store_true",
                         help="모델 입력(sk_matte)을 원본 스케치와 비교 패널로 저장")
+    parser.add_argument("--stem",        default=None,
+                        help="특정 파일명(확장자 제외)만 처리 (예: braid_2653)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -161,7 +181,7 @@ def main():
 
     subsets = ["train", "test"] if args.subset == "both" else [args.subset]
     for subset in subsets:
-        process(args.style, subset, model, device, args.color_code, args.max_samples, args.save_input)
+        process(args.style, subset, model, device, args.color_code, args.max_samples, args.save_input, args.stem)
 
     print(f"\n완료: checkpoints/hairsalon_results/")
 
