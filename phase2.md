@@ -92,6 +92,42 @@ GAN은 `color_coding()` 함수로 학습 시 stroke 색을 교체한다.
 GAN baseline 실험에서 `color_coding` 적용 시 출력 머리 색이 stroke 색을 따르는 것을 확인하였다.
 
 ### 비교 결과
+### 변경 방식: StrokeColorSampler
+
+GAN의 `color_coding`과 동일한 원리를 DiT 학습에 적용한다.
+
+```python
+# 각 stroke 영역 → target 이미지의 해당 위치 픽셀 중 무작위 1개 샘플링
+# → 그 색을 stroke 색으로 할당 (매 iteration마다 새로 샘플링)
+```
+
+GAN과의 차이점:
+- GAN(`color_coding`): RGB 스케치를 grayscale로 변환한 뒤 밝기 값으로 stroke 구분
+  - `color_coding` 함수가 grayscale 입력을 요구하도록 구현되어 있어 변환 후 전달
+  - 서로 다른 색의 stroke라도 밝기가 비슷하면 같은 stroke로 합쳐지는 collision 위험
+- 우리(`StrokeColorSampler`): RGB 값 그대로 양자화하여 stroke 구분
+  - stroke마다 임의 레이블 색(보라, 파랑, 초록 등)이 부여되어 있어 RGB로 구분하면 collision 없이 정확하게 식별 가능
+
+`AppearanceJitter`도 함께 제거한다. target 색을 흔들면 stroke ↔ target 색 대응이 깨지기 때문이다.
+
+### 기대 효과
+
+```
+갈색 stroke → 갈색 머리  ✓ 
+금발 stroke → 금발 머리  ✓
+검정 stroke → 검정 머리  ✓
+```
+
+### 한계
+
+학습 데이터에 존재하지 않는 색(보라, 파란색 등 비자연 색상)은 제어 불가.
+색 제어 품질은 데이터셋 내 머리 색 분포에 직접적으로 의존한다.
+
+
+
+
+
+
 
 
 | Colored Sketch | input이 color sketch인 결과 | stroke 색 교체 후 Sketch | stroke 색 교체 결과 | DiT Generated(stroke 무작위) |
