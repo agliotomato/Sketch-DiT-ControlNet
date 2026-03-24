@@ -8,6 +8,7 @@ build/
 venv/
 *.egg
 
+
 # Dataset (too large for git)
 dataset3/
 
@@ -36,3 +37,5 @@ notebooks/.ipynb_checkpoints/
 # OS
 .DS_Store
 Thumbs.db
+
+SketchHairSalon/

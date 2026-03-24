@@ -35,22 +35,22 @@
 
 | Sketch | Matte | Generated | Target |
 |--------|-------|-----------|--------|
-| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2534.png" width="256"/> | <img src="results/0000_gen.png" width="256"/> | <img src="results/0000_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2537.png" width="256"/> | <img src="results/0001_gen.png" width="256"/> | <img src="results/0001_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2539.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2548.png" width="256"/> | <img src="results/0003_gen.png" width="256"/> | <img src="results/0003_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2562.png" width="256"/> | <img src="results/0004_gen.png" width="256"/> | <img src="results/0004_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2572.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2572.png" width="256"/> | <img src="results/0005_gen.png" width="256"/> | <img src="results/0005_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2574.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2574.png" width="256"/> | <img src="results/0006_gen.png" width="256"/> | <img src="results/0006_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2576.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2576.png" width="256"/> | <img src="results/0007_gen.png" width="256"/> | <img src="results/0007_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2590.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2590.png" width="256"/> | <img src="results/0008_gen.png" width="256"/> | <img src="results/0008_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2592.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2592.png" width="256"/> | <img src="results/0009_gen.png" width="256"/> | <img src="results/0009_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2617.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2617.png" width="256"/> | <img src="results/0010_gen.png" width="256"/> | <img src="results/0010_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2625.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2625.png" width="256"/> | <img src="results/0011_gen.png" width="256"/> | <img src="results/0011_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2652.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2652.png" width="256"/> | <img src="results/0012_gen.png" width="256"/> | <img src="results/0012_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2653.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2653.png" width="256"/> | <img src="results/0013_gen.png" width="256"/> | <img src="results/0013_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2657.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2657.png" width="256"/> | <img src="results/0014_gen.png" width="256"/> | <img src="results/0014_target.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2676.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2676.png" width="256"/> | <img src="results/0015_gen.png" width="256"/> | <img src="results/0015_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2534.png" width="256"/> | <img src="results/DiT(before)/0000_gen.png" width="256"/> | <img src="results/DiT(before)/0000_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2537.png" width="256"/> | <img src="results/DiT(before)/0001_gen.png" width="256"/> | <img src="results/DiT(before)/0001_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2539.png" width="256"/> | <img src="results/DiT(before)/0002_gen.png" width="256"/> | <img src="results/DiT(before)/0002_gen.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2548.png" width="256"/> | <img src="results/DiT(before)/0003_gen.png" width="256"/> | <img src="results/DiT(before)/0003_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2562.png" width="256"/> | <img src="results/DiT(before)/0004_gen.png" width="256"/> | <img src="results/DiT(before)/0004_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2572.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2572.png" width="256"/> | <img src="results/DiT(before)/0005_gen.png" width="256"/> | <img src="results/DiT(before)/0005_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2574.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2574.png" width="256"/> | <img src="results/DiT(before)/0006_gen.png" width="256"/> | <img src="results/DiT(before)/0006_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2576.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2576.png" width="256"/> | <img src="results/DiT(before)/0007_gen.png" width="256"/> | <img src="results/DiT(before)/0007_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2590.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2590.png" width="256"/> | <img src="results/DiT(before)/0008_gen.png" width="256"/> | <img src="results/DiT(before)/0008_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2592.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2592.png" width="256"/> | <img src="results/DiT(before)/0009_gen.png" width="256"/> | <img src="results/DiT(before)/0009_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2617.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2617.png" width="256"/> | <img src="results/DiT(before)/0010_gen.png" width="256"/> | <img src="results/DiT(before)/0010_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2625.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2625.png" width="256"/> | <img src="results/DiT(before)/0011_gen.png" width="256"/> | <img src="results/DiT(before)/0011_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2652.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2652.png" width="256"/> | <img src="results/DiT(before)/0012_gen.png" width="256"/> | <img src="results/DiT(before)/0012_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2653.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2653.png" width="256"/> | <img src="results/DiT(before)/0013_gen.png" width="256"/> | <img src="results/DiT(before)/0013_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2657.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2657.png" width="256"/> | <img src="results/DiT(before)/0014_gen.png" width="256"/> | <img src="results/DiT(before)/0014_target.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2676.png" width="256"/> | <img src="dataset/braid/matte/test/braid_2676.png" width="256"/> | <img src="results/DiT(before)/0015_gen.png" width="256"/> | <img src="results/DiT(before)/0015_target.png" width="256"/> |
 
 
 ## GAN 과의 비교
@@ -92,17 +92,6 @@ GAN은 `color_coding()` 함수로 학습 시 stroke 색을 교체한다.
 GAN baseline 실험에서 `color_coding` 적용 시 출력 머리 색이 stroke 색을 따르는 것을 확인하였다.
 
 ### 비교 결과
-
-
-| Colored Sketch | input이 color sketch인 결과 | stroke 색 교체 후 Sketch | stroke 색 교체 결과 | DiT Generated(stroke 무작위) |
-|---|---|---|---|---|
-| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2534.png"  width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2534_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2534.png" width="256"/> | <img src="results/0000_gen.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2537.png" width="256"/> | <img src="checkpoints2//braid_test_color_coded/braid_2537_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2537.png" width="256"/> | <img src="results/0001_gen.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2539.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2539_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2539.png" width="256"/> | <img src="results/0002_gen.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2548.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2548_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2548.png" width="256"/> | <img src="results/0003_gen.png" width="256"/> |
-| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2562.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2562_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2562.png" width="256"/> | <img src="results/0004_gen.png" width="256"/> |
-
-
 ### 변경 방식: StrokeColorSampler
 
 GAN의 `color_coding`과 동일한 원리를 DiT 학습에 적용한다.
@@ -140,3 +129,38 @@ GAN과의 차이점:
 
 
 
+
+| Colored Sketch | input이 color sketch인 결과 | stroke 색 교체 후 Sketch | stroke 색 교체 결과 | DiT Generated(stroke 무작위) |
+|---|---|---|---|---|
+| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2534.png"  width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2534_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2534.png" width="256"/> | <img src="results/DiT(before)/0000_gen.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2537.png" width="256"/> | <img src="checkpoints2//braid_test_color_coded/braid_2537_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2537.png" width="256"/> | <img src="results/DiT(before)/0001_gen.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2539.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2539_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2539.png" width="256"/> | <img src="results/DiT(before)/0002_gen.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2548.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2548_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2548.png" width="256"/> | <img src="results/DiT(before)/0003_gen.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="checkpoints2/braid_test/braid_2562.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2562_sk.png" width="256"/> | <img src="checkpoints2/braid_test_color_coded/braid_2562.png" width="256"/> | <img src="results/DiT(before)/0004_gen.png" width="256"/> |
+
+
+## 변경 사항
+[상세 내용 (color.md)](https://github.com/agliotomato/Sketch-DiT-ControlNet/blob/exp1-stroke-color/color.md)
+
+| Sketch | DiT(before) | DiT(After) | GAN |
+|--------|-------------|------------|-----|
+| <img src="dataset/braid/sketch/test/braid_2534.png" width="256"/> | <img src="results/DiT(before)/0000_gen.png" width="256"/> | <img src="results/DiT(after)/braid_2534_gen.png" width="256"/> | <img src="results/GAN/braid_2534.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2537.png" width="256"/> | <img src="results/DiT(before)/0001_gen.png" width="256"/> | <img src="results/DiT(after)/braid_2537_gen.png" width="256"/> | <img src="results/GAN/braid_2537.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2539.png" width="256"/> | <img src="results/DiT(before)/0002_gen.png" width="256"/> | <img src="results/DiT(after)/braid_2539_gen.png" width="256"/> | <img src="results/GAN/braid_2539.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2548.png" width="256"/> | <img src="results/DiT(before)/0003_gen.png" width="256"/> | <img src="results/DiT(after)/braid_2548_gen.png" width="256"/> | <img src="results/GAN/braid_2548.png" width="256"/> |
+| <img src="dataset/braid/sketch/test/braid_2562.png" width="256"/> | <img src="results/DiT(before)/0004_gen.png" width="256"/> | <img src="results/DiT(after)/braid_2562_gen.png" width="256"/> | <img src="results/GAN/braid_2562.png" width="256"/> |
+
+DiT로도 스트로크에 의한 색상 제어가 가능함을 확인하였다!
+
+
+## 추가로 같이 하면 좋을 것.
+
+직접 스케치 그려서 matte 생성하고 GAN과 DiT로 생성해보기ㅣ
+
+| test | for_matte | matte | test_sketch |
+|---|---|---|---|
+| <img src="results/custom_results/data/test.png" width="256"/> | <img src="results/custom_results/data/for_matte.png" width="256"/> | <img src="results/custom_results/data/matte.png" width="256"/> | <img src="results/custom_results/data/test_sketch.png" width="256"/> |
+
+| sketch | matte | GAN | DiT |
+|---|---|---|---|
+| <img src="results/custom_results/data/test_sketch.png" width="256"/> | <img src="results/custom_results/data/matte.png" width="256"/> | <img src="results/custom_results/1_sketch_gen.png" width="256"/> | <img src="results/custom_results/1_gen.png" width="256"/> |
