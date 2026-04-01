@@ -106,6 +106,27 @@ def sketch_to_matte(sketch: torch.Tensor) -> torch.Tensor:
     return fg.unsqueeze(0).unsqueeze(0)
 
 
+def recolor_sketch(sketch: torch.Tensor, hair_color: tuple[int, int, int]) -> torch.Tensor:
+    """
+    스케치의 모든 stroke 색을 지정한 머리 색으로 교체한다.
+    배경(거의 흰색 or 거의 검정)은 그대로 유지.
+
+    sketch: (1, 3, 512, 512) float [0,1]
+    hair_color: (R, G, B) 0-255
+    returns: (1, 3, 512, 512) float [0,1]
+    """
+    color = torch.tensor([c / 255.0 for c in hair_color], dtype=sketch.dtype)  # (3,)
+
+    s = sketch.squeeze(0)  # (3, H, W)
+    # stroke 픽셀 = 배경(흰색/검정)이 아닌 곳
+    brightness = s.mean(dim=0)  # (H, W)
+    is_stroke = (brightness > 0.05) & (brightness < 0.95)  # 배경 제외
+
+    result = s.clone()
+    result[:, is_stroke] = color.unsqueeze(1).expand(-1, is_stroke.sum())
+    return result.unsqueeze(0)
+
+
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
@@ -195,6 +216,8 @@ def main():
     parser.add_argument("--config",      required=True)
     parser.add_argument("--num_steps",   type=int, default=20)
     parser.add_argument("--output_dir",  default="custom_results")
+    parser.add_argument("--hair_color",  default=None,
+                        help="stroke 색 교체 (R,G,B 0-255). 예: 139,90,43 (갈색)")
     args = parser.parse_args()
 
     cfg    = load_config(args.config)
@@ -232,8 +255,16 @@ def main():
     pairs = collect_pairs(args.sketch, args.matte)
     print(f"\n{len(pairs)}개 스케치 처리\n")
 
+    hair_color = None
+    if args.hair_color:
+        hair_color = tuple(int(x) for x in args.hair_color.split(","))
+        print(f"Stroke 색 교체: RGB{hair_color}")
+
     for sketch_file, matte_file, stem in tqdm(pairs, desc="Generating"):
         sketch = load_sketch(sketch_file)
+
+        if hair_color:
+            sketch = recolor_sketch(sketch, hair_color)
 
         if matte_file and matte_file.exists():
             matte = load_matte(matte_file)
