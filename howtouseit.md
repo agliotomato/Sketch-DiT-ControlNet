@@ -11,6 +11,17 @@
          → GAN (hairsalon_S2I_braid)             → DiT (our best.pth)
          → hair patch                            → hair patch
          (infer_hairsalon_custom.py)             (infer_custom.py)
+                         │                                      │
+                         └──────────────┬───────────────────────┘
+                                        ▼
+                              [face 이미지] + matte
+                            → composite.py
+                            → composited image
+                                        │
+                                        ▼
+                              [composited] + matte
+                            → inpaint_boundary.py
+                            → 최종 합성 이미지
 ```
 
 ---
@@ -89,7 +100,7 @@ cd ~/hair-dit
 python scripts/infer_custom.py \
   --sketch     <S2I_스케치_경로> \
   --matte      SketchHairSalon/results/generated_matte/<파일명>.png \
-  --checkpoint checkpoints/best.pth \
+  --checkpoint checkpoints/dit/phase2_braid/final.pth \
   --config     configs/phase2_braid.yaml \
   --output_dir custom_results/dit/
 ```
@@ -97,6 +108,59 @@ python scripts/infer_custom.py \
 **결과 파일:**
 - `custom_results/dit/{stem}_gen.png` — 생성된 hair patch
 - `custom_results/dit/{stem}_panel.png` — [sketch | matte | generated]
+
+---
+
+## Step 5. Face 이미지에 합성 (Composite)
+
+생성된 hair patch를 원본 face 이미지에 alpha 합성한다.
+
+```bash
+cd ~/hair-dit
+python scripts/composite.py \
+  --hair   custom_results/dit/<stem>_gen.png \
+  --face   <face_이미지_경로> \
+  --matte  SketchHairSalon/results/generated_matte/<파일명>.png \
+  --output results/composite/<stem>_composited.png
+```
+
+**주요 옵션:**
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `--feather` | 3.0 | Gaussian feathering sigma. 경계 부드러움 조절 (0=off) |
+| `--scale` | 1.0 | hair/matte 스케일 (1.0=원본) |
+| `--offset_x` | 0 | x축 이동 (픽셀, 양수=오른쪽) |
+| `--offset_y` | 0 | y축 이동 (픽셀, 양수=아래쪽) |
+
+**결과 파일:** `results/composite/{stem}_composited.png`
+
+---
+
+## Step 6. 경계 Inpainting (Boundary Inpainting)
+
+합성 이미지의 hair-face 경계를 SD2 inpainting으로 자연스럽게 blending한다.
+경계 안팎 ring(`dilate(matte) - erode(matte)`)을 마스크로 사용하여 양쪽 모두 inpaint.
+
+```bash
+cd ~/hair-dit
+python scripts/inpaint_boundary.py \
+  --composited results/composite/<stem>_composited.png \
+  --matte      SketchHairSalon/results/generated_matte/<파일명>.png \
+  --output     results/final/<stem>_final.png
+```
+
+**주요 옵션:**
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `--dilate` | 20 | 경계 ring 두께 (px). 클수록 더 넓은 영역 inpaint |
+| `--strength` | 0.45 | inpainting strength. 낮을수록 원본 보존 |
+| `--steps` | 20 | denoising steps |
+
+**결과 파일:** `results/final/{stem}_final.png`
+
+> Hair 내부는 항상 원본 composite로 복원되므로 생성된 hair 품질은 유지됨.
 
 ---
 
