@@ -141,15 +141,36 @@ noise (16ch, 64×64) ──→ SD3.5 Transformer (24 blocks, frozen)
 
 ## 결과 비교
 
-Phase 2 학습 후 braid_test에서의 Sketch / Matte / Generated / Target 비교:
-
-| Sketch | DiT (before color) | DiT (after color) | GAN |
-|---|---|---|---|
-| braid_2534 | results/DiT(before)/0000_gen.png | results/DiT(after)/braid_2534_gen.png | results/GAN/braid_2534.png |
-
 > 상세 결과 이미지: [phase2.md](phase2.md)
 
+| Sketch | GAN | DiT (Ours) |
+|:---:|:---:|:---:|
+| <img src="dataset/braid/sketch/test/braid_2534.png" width="200"/> | <img src="results/GAN/braid_2534.png" width="200"/> | <img src="results/DiT(after)/braid_2534_gen.png" width="200"/> |
+| <img src="dataset/braid/sketch/test/braid_2537.png" width="200"/> | <img src="results/GAN/braid_2537.png" width="200"/> | <img src="results/DiT(after)/braid_2537_gen.png" width="200"/> |
+| <img src="dataset/braid/sketch/test/braid_2548.png" width="200"/> | <img src="results/GAN/braid_2548.png" width="200"/> | <img src="results/DiT(after)/braid_2548_gen.png" width="200"/> |
+
 DiT로도 stroke 색에 의한 머리색 제어가 가능함을 확인하였다.
+
+---
+
+### 직접 그린 스케치 — Custom Sketch 결과
+
+| Sketch | Matte | GAN | DiT(Ours) |
+|:---:|:---:|:---:|:---:|
+| <img src="results/custom_results/data/test_sketch.png" width="200"/> | <img src="results/custom_results/data/matte.png" width="200"/> | <img src="results/custom_results/1_sketch_gen.png" width="200"/> | <img src="results/custom_results/1_gen.png" width="200"/> |
+
+---
+
+## 최종 합성 결과 (DiT → composite → boundary inpainting)
+
+hair patch 생성 후 face 이미지에 alpha 합성 + SD2 경계 inpainting까지 적용한 최종 출력.
+
+| | | | |
+|:---:|:---:|:---:|:---:|
+| <img src="results/final/braid_2534.png" width="180"/> | <img src="results/final/braid_2537.png" width="180"/> | <img src="results/final/braid_2539.png" width="180"/> | <img src="results/final/braid_2548.png" width="180"/> |
+| <img src="results/final/braid_2562.png" width="180"/> | <img src="results/final/braid_2572.png" width="180"/> | <img src="results/final/braid_2574.png" width="180"/> | <img src="results/final/braid_2576.png" width="180"/> |
+| <img src="results/final/braid_2590.png" width="180"/> | <img src="results/final/braid_2592.png" width="180"/> | <img src="results/final/braid_2617.png" width="180"/> | <img src="results/final/braid_2625.png" width="180"/> |
+| <img src="results/final/braid_2652.png" width="180"/> | <img src="results/final/braid_2653.png" width="180"/> | <img src="results/final/braid_2657.png" width="180"/> | <img src="results/final/braid_2676.png" width="180"/> |
 
 ---
 
