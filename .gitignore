@@ -17,7 +17,6 @@ checkpoints/
 
 # Logs
 runs/
-logs/
 *.log
 
 # Jupyter
