@@ -11,6 +11,10 @@ venv/
 
 # Dataset (too large for git)
 dataset3/
+dataset/
+custom_results/
+results/
+eval_results/
 
 # Checkpoints
 checkpoints/

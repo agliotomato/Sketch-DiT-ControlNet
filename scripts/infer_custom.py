@@ -4,32 +4,47 @@
 학습에 쓰이지 않은 스케치(현택씨 커스텀 등) generalization 테스트용.
 
 Usage:
-  # 단일 파일
+  # 단일 파일 (hair patch만)
   python scripts/infer_custom.py \
     --sketch    custom/my_sketch.png \
     --matte     custom/my_matte.png \
-    --checkpoint checkpoints/phase1_unbraid/best.pth \
-    --config    configs/phase1_unbraid.yaml \
+    --checkpoint checkpoints/phase2_braid/final.pth \
+    --config    configs/phase2_braid.yaml \
+    --output_dir custom_results/
+
+  # face 이미지 포함 → latent space 합성으로 full image 출력
+  python scripts/infer_custom.py \
+    --sketch    custom/my_sketch.png \
+    --matte     custom/my_matte.png \
+    --face      custom/my_face.png \
+    --checkpoint checkpoints/phase2_braid/final.pth \
+    --config    configs/phase2_braid.yaml \
     --output_dir custom_results/
 
   # 폴더 일괄 처리 (sketch/*.png 와 matte/*.png 파일명 매칭)
   python scripts/infer_custom.py \
     --sketch    custom/sketches/ \
     --matte     custom/mattes/ \
-    --checkpoint checkpoints/phase2_braid/best.pth \
+    --face      custom/faces/ \
+    --checkpoint checkpoints/phase2_braid/final.pth \
     --config    configs/phase2_braid.yaml \
     --output_dir custom_results/
 
   # matte 없음 → 스케치 비-배경 영역을 matte로 자동 사용
   python scripts/infer_custom.py \
     --sketch    custom/my_sketch.png \
-    --checkpoint checkpoints/phase2_braid/best.pth \
+    --checkpoint checkpoints/phase2_braid/final.pth \
     --config    configs/phase2_braid.yaml \
     --output_dir custom_results/
 
-출력:
+출력 (face 없을 때):
   {name}_gen.png   — 생성된 hair patch
-  {name}_panel.png — [sketch | matte | generated] 3열 비교
+  {name}_panel.png — [sketch | matte | hair patch] 3열 비교
+
+출력 (face 있을 때):
+  {name}_gen.png   — 생성된 hair patch
+  {name}_full.png  — face + hair latent 합성 full image
+  {name}_panel.png — [sketch | matte | hair patch | full image] 4열 비교
 """
 
 import argparse
@@ -38,6 +53,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from PIL import Image
 from tqdm import tqdm
@@ -100,6 +116,11 @@ def load_matte(path: Path) -> torch.Tensor:
     return _to_tensor_gray(Image.open(path).convert("L")).unsqueeze(0)
 
 
+def load_face(path: Path) -> torch.Tensor:
+    """Returns (1, 3, 512, 512) float [0,1]."""
+    return _to_tensor_rgb(Image.open(path).convert("RGB")).unsqueeze(0)
+
+
 def sketch_to_matte(sketch: torch.Tensor) -> torch.Tensor:
     """스케치 비-배경 영역(비검정)을 matte로 사용. (1,1,512,512)"""
     fg = (sketch.squeeze(0).max(dim=0).values > 0.05).float()
@@ -133,9 +154,10 @@ def recolor_sketch(sketch: torch.Tensor, hair_color: tuple[int, int, int]) -> to
 
 @torch.no_grad()
 def run_sampling(
-    controlnet, transformer, vae, scheduler,
+    controlnet, transformer, scheduler,
     sketch, matte, num_steps, device,
 ) -> torch.Tensor:
+    """Euler sampling → hair latent (1, 16, 64, 64). Decode는 caller에서."""
     scheduler.set_timesteps(num_steps, device=device)
     latents = torch.randn(1, 16, 64, 64, device=device, dtype=torch.bfloat16)
 
@@ -164,8 +186,38 @@ def run_sampling(
 
         latents = scheduler.step(v_pred, t, latents, return_dict=False)[0]
 
-    image = vae.decode(latents)
-    return (image.float().clamp(-1, 1) + 1) / 2  # [0,1]
+    return latents  # (1, 16, 64, 64)
+
+
+@torch.no_grad()
+def decode_hair(vae, hair_latent: torch.Tensor) -> torch.Tensor:
+    """hair latent → hair patch [0,1]."""
+    image = vae.decode(hair_latent)
+    return (image.float().clamp(-1, 1) + 1) / 2
+
+
+@torch.no_grad()
+def composite_latent_and_decode(
+    vae,
+    hair_latent: torch.Tensor,
+    matte: torch.Tensor,
+    face: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Latent space 합성 (SHS 방식): hair_latent * m + face_latent * (1-m) → decode → [0,1].
+    matte: (1, 1, 512, 512) → area pooling으로 64×64 다운샘플 후 soft weighted-sum.
+    """
+    face_latent = vae.encode(face.to(device=device, dtype=torch.bfloat16))
+    # area pooling: 픽셀 평균으로 matte 값 보존 (SHS soft blend용)
+    matte_latent = F.interpolate(
+        matte.to(device), size=(64, 64), mode="area"
+    ).to(dtype=torch.bfloat16)
+
+    # SHS 방식 soft weighted-sum: feature * m + bg_feature * (1 - m)
+    composite = hair_latent * matte_latent + face_latent * (1.0 - matte_latent)
+    image = vae.decode(composite)
+    return (image.float().clamp(-1, 1) + 1) / 2
 
 
 # ---------------------------------------------------------------------------
@@ -183,25 +235,34 @@ def to_uint8(t: torch.Tensor) -> np.ndarray:
 # Input collection
 # ---------------------------------------------------------------------------
 
-def collect_pairs(sketch_arg: str, matte_arg: str | None) -> list[tuple[Path, Path | None, str]]:
+def collect_pairs(
+    sketch_arg: str,
+    matte_arg: str | None,
+    face_arg: str | None,
+) -> list[tuple[Path, Path | None, Path | None, str]]:
     sketch_path = Path(sketch_arg)
     if sketch_path.is_dir():
         files = sorted(sketch_path.glob("*.png")) + sorted(sketch_path.glob("*.jpg"))
         pairs = []
         for sf in files:
-            mf = None
-            if matte_arg:
-                mp = Path(matte_arg)
-                for ext in (".png", ".jpg"):
-                    candidate = mp / (sf.stem + ext)
-                    if candidate.exists():
-                        mf = candidate
-                        break
-            pairs.append((sf, mf, sf.stem))
+            mf = ff = None
+            for arg, ref in ((matte_arg, "mf"), (face_arg, "ff")):
+                if arg:
+                    mp = Path(arg)
+                    for ext in (".png", ".jpg"):
+                        candidate = mp / (sf.stem + ext)
+                        if candidate.exists():
+                            if ref == "mf":
+                                mf = candidate
+                            else:
+                                ff = candidate
+                            break
+            pairs.append((sf, mf, ff, sf.stem))
         return pairs
     else:
         mf = Path(matte_arg) if matte_arg else None
-        return [(sketch_path, mf, sketch_path.stem)]
+        ff = Path(face_arg) if face_arg else None
+        return [(sketch_path, mf, ff, sketch_path.stem)]
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +273,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sketch",      required=True)
     parser.add_argument("--matte",       default=None)
+    parser.add_argument("--face",        default=None,
+                        help="얼굴 이미지 (있으면 latent space 합성으로 full image 출력)")
     parser.add_argument("--checkpoint",  required=True)
     parser.add_argument("--config",      required=True)
     parser.add_argument("--num_steps",   type=int, default=20)
@@ -244,15 +307,16 @@ def main():
         num_layers=cfg["model"].get("num_controlnet_layers", 12),
         local_files_only=local_files_only,
     )
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
     controlnet.load_state_dict(ckpt["controlnet"])
+    del ckpt
     controlnet = controlnet.to(device=device, dtype=torch.bfloat16).eval()
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_id, subfolder="scheduler", local_files_only=local_files_only,
     )
 
-    pairs = collect_pairs(args.sketch, args.matte)
+    pairs = collect_pairs(args.sketch, args.matte, args.face)
     print(f"\n{len(pairs)}개 스케치 처리\n")
 
     hair_color = None
@@ -260,7 +324,7 @@ def main():
         hair_color = tuple(int(x) for x in args.hair_color.split(","))
         print(f"Stroke 색 교체: RGB{hair_color}")
 
-    for sketch_file, matte_file, stem in tqdm(pairs, desc="Generating"):
+    for sketch_file, matte_file, face_file, stem in tqdm(pairs, desc="Generating"):
         sketch = load_sketch(sketch_file)
 
         if hair_color:
@@ -273,14 +337,30 @@ def main():
                 print(f"  [WARNING] matte 없음: {matte_file} → 스케치 fg 영역으로 대체")
             matte = sketch_to_matte(sketch)
 
-        gen = run_sampling(
-            controlnet, transformer, vae, scheduler,
+        hair_latent = run_sampling(
+            controlnet, transformer, scheduler,
             sketch, matte, args.num_steps, device,
         )
 
-        Image.fromarray(to_uint8(gen.cpu())).save(output_dir / f"{stem}_gen.png")
+        hair_patch = decode_hair(vae, hair_latent)
+        Image.fromarray(to_uint8(hair_patch.cpu())).save(output_dir / f"{stem}_gen.png")
 
-        panel = np.concatenate([to_uint8(sketch), to_uint8(matte), to_uint8(gen.cpu())], axis=1)
+        if face_file and face_file.exists():
+            face = load_face(face_file)
+            full = composite_latent_and_decode(vae, hair_latent, matte, face, device)
+            Image.fromarray(to_uint8(full.cpu())).save(output_dir / f"{stem}_full.png")
+
+            panel = np.concatenate([
+                to_uint8(sketch), to_uint8(matte),
+                to_uint8(hair_patch.cpu()), to_uint8(full.cpu()),
+            ], axis=1)
+        else:
+            if face_file:
+                print(f"  [WARNING] face 없음: {face_file}")
+            panel = np.concatenate([
+                to_uint8(sketch), to_uint8(matte), to_uint8(hair_patch.cpu()),
+            ], axis=1)
+
         Image.fromarray(panel).save(output_dir / f"{stem}_panel.png")
 
     print(f"\n완료: {output_dir}/")
