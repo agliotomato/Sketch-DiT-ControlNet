@@ -13,6 +13,7 @@ Usage:
   콘솔 요약 테이블
 """
 
+import argparse
 import csv
 import math
 from pathlib import Path
@@ -23,11 +24,21 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-GT_IMG_DIR    = Path("dataset/braid/img/test")
-GT_MATTE_DIR  = Path("dataset/braid/matte/test")
-GAN_DIR       = Path("custom_results/gan/shs")
-DIT_DIR       = Path("custom_results/test_batch2")
-OUT_DIR       = Path("eval_results")
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dit_dir",    default="custom_results/test_batch2")
+    parser.add_argument("--gan_dir",    default="custom_results/gan/shs")
+    parser.add_argument("--gt_img_dir", default="dataset/braid/img/test")
+    parser.add_argument("--gt_matte_dir", default="dataset/braid/matte/test")
+    parser.add_argument("--out_dir",    default="eval_results")
+    return parser.parse_args()
+
+_args = parse_args()
+GT_IMG_DIR    = Path(_args.gt_img_dir)
+GT_MATTE_DIR  = Path(_args.gt_matte_dir)
+GAN_DIR       = Path(_args.gan_dir)
+DIT_DIR       = Path(_args.dit_dir)
+OUT_DIR       = Path(_args.out_dir)
 OUT_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------

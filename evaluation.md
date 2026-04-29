@@ -2,21 +2,36 @@
 
 ## Overall Summary (n=107, hair region masked)
 
-| Metric | GAN (SHS) | DiT (full) |
-|--------|:---------:|:----------:|
-| **Edge IoU ↑** | 0.1031 | **0.1047** |
-| **Chamfer Dist ↓** | 2.6926 | **2.6739** |
-| **Sketch LPIPS ↓** | **0.7590** | 0.7776 |
-| **Hair FID ↓** | 195.06 | **177.63** |
-| **LPIPS (GT) ↓** | 0.3263 | **0.3250** |
-| **SSIM (GT) ↑** | 0.5906 | **0.5936** |
-| **PSNR (GT) ↑** | 11.18 | **12.16** |
-| **Boundary FID ↓** | 50.95 | **37.16** |
-| **Boundary LPIPS ↓** | 0.0272 | **0.0267** |
-| **Face LPIPS ↓** | 0.0036 | **0.0000** |
-| **ArcFace Cos ↑** | 0.7697 | **0.7916** |
+| Metric | GAN (SHS) | DiT v1 (hard mask) | DiT v2 (weighted sum) | DiT v3 (weighted sum + pixel 후처리) |
+|--------|:---------:|:------------------:|:---------------------:|:------------------------------------:|
+| **Edge IoU ↑** | 0.1031 | 0.1047 | 0.1052 | **0.1062** |
+| **Chamfer Dist ↓** | 2.6926 | 2.6739 | 2.6636 | **2.6412** |
+| **Sketch LPIPS ↓** | **0.7590** | 0.7776 | 0.7734 | 0.7728 |
+| **Hair FID ↓** | 195.06 | 177.63 | 174.09 | **171.16** |
+| **LPIPS (GT) ↓** | 0.3263 | 0.3250 | 0.3254 | **0.3227** |
+| **SSIM (GT) ↑** | 0.5906 | 0.5936 | 0.6012 | **0.6011** |
+| **PSNR (GT) ↑** | 11.18 | 12.16 | 12.40 | **12.41** |
+| **Boundary FID ↓** | 50.95 | **37.16** | 40.89 | 39.05 |
+| **Boundary LPIPS ↓** | 0.0272 | **0.0267** | 0.0361 | 0.0355 |
+| **Face LPIPS ↓** | 0.0036 | **0.0000** | 0.0302 | 0.0301 |
+| **ArcFace Cos ↑** | 0.7697 | **0.7916** | 0.7781 | 0.7797 |
 
 > FID: 107장 기준 (500장 이하, 참고용). ArcFace Cos: ResNet50 (ImageNet) embedding proxy.
+
+### Composite 방식별 비교
+
+| 버전 | Latent 합성 | Pixel 후처리 |
+|------|------------|-------------|
+| v1 | hard mask (matte > 0.5) | hard mask로 face 교체 |
+| v2 | soft weighted-sum (area pooling) | 없음 |
+| v3 | soft weighted-sum (area pooling) | hard mask로 face 교체 |
+
+### 분석
+
+- **hair 생성 품질** (PSNR, SSIM, LPIPS, Hair FID, Edge IoU, Chamfer): v3 전체 최고
+- **경계/얼굴 보존** (Boundary FID, Boundary LPIPS, Face LPIPS, ArcFace): v1이 가장 좋음
+- v2 vs v3: pixel 후처리 복원으로 Face LPIPS(0.0302→0.0301), Boundary FID(40.89→39.05) 소폭 개선되나 v1 수준은 아님
+- pixel 후처리가 hard mask라서 soft blend의 경계 이점을 pixel space에서 덮어씌우는 구조적 한계
 
 ---
 

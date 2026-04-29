@@ -217,7 +217,13 @@ def composite_latent_and_decode(
     # SHS 방식 soft weighted-sum: feature * m + bg_feature * (1 - m)
     composite = hair_latent * matte_latent + face_latent * (1.0 - matte_latent)
     image = vae.decode(composite)
-    return (image.float().clamp(-1, 1) + 1) / 2
+    image_01 = (image.float().clamp(-1, 1) + 1) / 2
+
+    # pixel space: matte 값으로 soft blend (얼굴 보존)
+    matte_pixel = matte.to(device=device, dtype=torch.float32)
+    face_01 = face.to(device=device, dtype=torch.float32)
+    image_01 = image_01 * matte_pixel + face_01 * (1.0 - matte_pixel)
+    return image_01
 
 
 # ---------------------------------------------------------------------------
