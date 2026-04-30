@@ -20,7 +20,7 @@ from torchvision import transforms
 
 from .utils import soft_composite
 
-DATASET_ROOT = Path(__file__).parent.parent.parent / "dataset3"
+DATASET_ROOT = Path(__file__).parent.parent.parent / "dataset"
 
 
 def _build_stem_index(img_dir: Path) -> list[str]:
