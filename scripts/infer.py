@@ -1,7 +1,7 @@
 """
 Inference: (sketch + matte) → hair region image using HairControlNet + SD3.5.
 
-Saves [sketch | matte | generated | target] 4-panel grid for visual inspection.
+Saves [sketch | matte | generated | target | composite] 5-panel grid for visual inspection.
 
 Usage:
   python scripts/infer.py \
@@ -119,14 +119,20 @@ def to_uint8(t: torch.Tensor) -> np.ndarray:
     return (t.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
 
 
-def make_panel(sketch, matte, gen, target) -> np.ndarray:
-    """Concatenate 4 images horizontally into one row."""
+def composite(gen: torch.Tensor, face: torch.Tensor, matte: torch.Tensor) -> torch.Tensor:
+    """Alpha blend generated hair onto face. All (1, C, H, W) [0,1]."""
+    return (gen * matte + face * (1.0 - matte)).clamp(0, 1)
+
+
+def make_panel(sketch, matte, gen, target, comp) -> np.ndarray:
+    """Concatenate 5 images horizontally into one row."""
     return np.concatenate([
         to_uint8(sketch),
         to_uint8(matte),
         to_uint8(gen),
         to_uint8(target),
-    ], axis=1)  # (512, 2048, 3)
+        to_uint8(comp),
+    ], axis=1)  # (512, 2560, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +196,7 @@ def main():
         sketch = data["sketch"].unsqueeze(0)
         matte  = data["matte"].unsqueeze(0)
         target = data["target"].unsqueeze(0)
+        face   = data["img"].unsqueeze(0)
 
         gen = run_sampling(
             controlnet=controlnet,
@@ -202,17 +209,21 @@ def main():
             device=device,
         )
 
-        # Save individual
-        Image.fromarray(to_uint8(gen.cpu())).save(output_dir / f"{idx:04d}_gen.png")
+        gen_cpu  = gen.cpu()
+        comp     = composite(gen_cpu, face, matte)
 
-        rows.append(make_panel(sketch, matte, gen.cpu(), target))
+        # Save individual
+        Image.fromarray(to_uint8(gen_cpu)).save(output_dir / f"{idx:04d}_gen.png")
+        Image.fromarray(to_uint8(comp)).save(output_dir / f"{idx:04d}_composite.png")
+
+        rows.append(make_panel(sketch, matte, gen_cpu, target, comp))
 
     # Save grid (header label via blank row would need PIL draw, skip for simplicity)
     grid = np.concatenate(rows, axis=0)
     grid_path = output_dir / "grid.png"
     Image.fromarray(grid).save(grid_path)
     print(f"\nGrid saved: {grid_path}")
-    print(f"Columns: sketch | matte | generated | target")
+    print(f"Columns: sketch | matte | generated | target | composite")
 
 
 if __name__ == "__main__":

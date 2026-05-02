@@ -351,23 +351,19 @@ def main():
         hair_patch = decode_hair(vae, hair_latent)
         Image.fromarray(to_uint8(hair_patch.cpu())).save(output_dir / f"{stem}_gen.png")
 
+        panel_imgs = [to_uint8(sketch.cpu()), to_uint8(matte.cpu()), to_uint8(hair_patch.cpu())]
+
         if face_file and face_file.exists():
             face = load_face(face_file)
             full = composite_latent_and_decode(vae, hair_latent, matte, face, device)
             Image.fromarray(to_uint8(full.cpu())).save(output_dir / f"{stem}_full.png")
-
-            panel = np.concatenate([
-                to_uint8(sketch), to_uint8(matte),
-                to_uint8(hair_patch.cpu()), to_uint8(full.cpu()),
-            ], axis=1)
+            panel_imgs.append(to_uint8(full.cpu()))
         else:
             if face_file:
                 print(f"  [WARNING] face 없음: {face_file}")
-            panel = np.concatenate([
-                to_uint8(sketch), to_uint8(matte), to_uint8(hair_patch.cpu()),
-            ], axis=1)
 
-        Image.fromarray(panel).save(output_dir / f"{stem}_panel.png")
+        panel = Image.fromarray(np.concatenate(panel_imgs, axis=1))
+        panel.save(output_dir / f"{stem}_panel.png")
 
     print(f"\n완료: {output_dir}/")
 
