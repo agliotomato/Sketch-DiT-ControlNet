@@ -68,7 +68,7 @@ class Trainer:
         self.accelerator = Accelerator(
             mixed_precision=config["training"].get("mixed_precision", "bf16"),
             gradient_accumulation_steps=config["training"].get("gradient_accumulation_steps", 2),
-            log_with="tensorboard",
+            log_with=["tensorboard", "wandb"],
             project_dir=config["checkpointing"]["output_dir"],
         )
 
@@ -92,6 +92,23 @@ class Trainer:
 
         self.output_dir = Path(config["checkpointing"]["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Tracker 초기화 (TensorBoard + wandb)
+        wcfg = config.get("wandb", {})
+        run_name = f"{config['training']['phase']}_{config['training']['dataset']}"
+        tags = wcfg.get("tags", []) + [config["training"]["phase"], config["training"]["dataset"]]
+        self.accelerator.init_trackers(
+            project_name=wcfg.get("project", "hair-dit"),
+            config=config,
+            init_kwargs={
+                "wandb": {
+                    "name": run_name,
+                    "entity": wcfg.get("entity") or None,
+                    "tags": tags,
+                    "dir": str(self.output_dir),
+                },
+            },
+        )
 
         # Flow matching timestep sampling hyperparams
         self.logit_mean = config["training"].get("logit_mean", 0.0)
@@ -299,6 +316,10 @@ class Trainer:
             if (epoch + 1) % eval_every == 0:
                 val_loss = self._validate()
                 self.accelerator.print(f"Val loss: {val_loss:.4f}")
+                self.accelerator.log(
+                    {"val_loss": val_loss, "epoch": epoch + 1},
+                    step=self.global_step,
+                )
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self._save_checkpoint("best.pth")

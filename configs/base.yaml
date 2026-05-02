@@ -20,3 +20,8 @@ training:
 checkpointing:
   eval_every: 10
   save_every: 20
+
+wandb:
+  project: hair-dit
+  entity: null       # wandb 팀/계정명 (null이면 기본 계정)
+  tags: []
