@@ -16,7 +16,7 @@ training:
   loss_weights:
     structure: 1.0
     color: 0.5
-    matte: 1.0
+    matte: 2.0             # 전체 사진 입력 → segmentation 역할 강화
     feature: 0.1
 
 mixed_precision: bf16

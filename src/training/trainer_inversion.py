@@ -207,7 +207,7 @@ class InversionTrainer:
         device = self.accelerator.device
         dtype  = torch.bfloat16
 
-        hair_image  = batch["target"].to(device, dtype=dtype)   # (B, 3, 512, 512) img*matte
+        hair_image  = batch["img"].to(device, dtype=dtype)        # (B, 3, 512, 512) 원본 전체 사진
         sketch_gt   = batch["sketch"].to(device, dtype=dtype)   # (B, 3, 512, 512)
         matte_gt    = batch["matte"].to(device, dtype=dtype)    # (B, 1, 512, 512)
 
@@ -244,7 +244,7 @@ class InversionTrainer:
         total, n = 0.0, 0
 
         for batch in self.val_loader:
-            hair_image = batch["target"].to(device, dtype=dtype)
+            hair_image = batch["img"].to(device, dtype=dtype)
             sketch_gt  = batch["sketch"].to(device, dtype=dtype)
             matte_gt   = batch["matte"].to(device, dtype=dtype)
 

@@ -59,10 +59,16 @@ class InversionLoss(nn.Module):
         # L_color: stroke 영역에서만 L1 (배경 오차 무시)
         l_color = (F.l1_loss(sketch_pred, sketch_gt, reduction="none") * stroke_mask_gt).mean()
 
-        l_matte = (
-            F.binary_cross_entropy(matte_pred, matte_gt)
-            + F.l1_loss(matte_pred, matte_gt)
-        )
+        # Matte loss: BCE + L1 + Dice
+        # 입력이 전체 사진이므로 배경→0을 강하게 밀어내야 함
+        # Dice loss: 클래스 불균형(배경 多, 헤어 少)에 강건
+        l_matte_bce  = F.binary_cross_entropy(matte_pred, matte_gt)
+        l_matte_l1   = F.l1_loss(matte_pred, matte_gt)
+        smooth       = 1e-6
+        intersection = (matte_pred * matte_gt).sum(dim=[1, 2, 3])
+        union        = matte_pred.sum(dim=[1, 2, 3]) + matte_gt.sum(dim=[1, 2, 3])
+        l_matte_dice = (1 - (2 * intersection + smooth) / (union + smooth)).mean()
+        l_matte      = l_matte_bce + l_matte_l1 + l_matte_dice
 
         total = (
             self.w_structure * l_structure
