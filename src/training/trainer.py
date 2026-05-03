@@ -52,6 +52,22 @@ from src.training.ema import EMAModel
 from src.training.losses import HairLoss
 
 
+def _flatten_config(cfg: dict, prefix: str = "") -> dict:
+    """Nested dict → flat dict with dot-separated keys (TensorBoard hparam 호환)."""
+    out = {}
+    for k, v in cfg.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten_config(v, key))
+        elif isinstance(v, (int, float, str, bool)):
+            out[key] = v
+        elif v is None:
+            out[key] = "null"
+        else:
+            out[key] = str(v)  # list 등은 문자열로
+    return out
+
+
 class Trainer:
     """
     Unified trainer for Phase 1 (pretrain) and Phase 2 (finetune).
@@ -99,13 +115,14 @@ class Trainer:
         tags = wcfg.get("tags", []) + [config["training"]["phase"], config["training"]["dataset"]]
         self.accelerator.init_trackers(
             project_name=wcfg.get("project", "hair-dit"),
-            config=config,
+            config=_flatten_config(config),  # TensorBoard은 primitive만 허용
             init_kwargs={
                 "wandb": {
                     "name": run_name,
                     "entity": wcfg.get("entity") or None,
                     "tags": tags,
                     "dir": str(self.output_dir),
+                    "config": config,  # wandb에는 원본 전달
                 },
             },
         )
