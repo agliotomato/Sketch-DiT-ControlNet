@@ -114,8 +114,11 @@ class Trainer:
         self.logit_mean = config["training"].get("logit_mean", 0.0)
         self.logit_std  = config["training"].get("logit_std",  1.0)
 
-        self.global_step = 0
+        self.global_step   = 0
         self.best_val_loss = float("inf")
+        self.start_epoch   = 0
+        self._current_epoch = 0
+        self._restore_training_state()
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -168,12 +171,18 @@ class Trainer:
             local_files_only=local_files_only,
         )
 
-        # Load Phase 1 checkpoint for Phase 2
+        # Phase 2 weight transfer (Phase 1 → Phase 2, controlnet only)
         resume_from = cfg["training"].get("resume_from")
         if resume_from and Path(resume_from).exists():
-            ckpt = torch.load(resume_from, map_location="cpu")
+            ckpt = torch.load(resume_from, map_location="cpu", weights_only=True)
             self.controlnet.load_state_dict(ckpt["controlnet"])
-            self.accelerator.print(f"Loaded checkpoint from {resume_from}")
+            self.accelerator.print(f"Loaded Phase 1 weights from {resume_from}")
+
+        # Full resume: load controlnet weights early (optimizer init needs correct params)
+        resume = cfg["training"].get("resume")
+        if resume and Path(resume).exists():
+            ckpt = torch.load(resume, map_location="cpu", weights_only=True)
+            self.controlnet.load_state_dict(ckpt["controlnet"])
 
     def _setup_data(self):
         cfg = self.cfg["training"]
@@ -279,9 +288,13 @@ class Trainer:
         save_every = self.cfg["checkpointing"].get("save_every", 20)
         grad_clip = cfg.get("gradient_clip", 1.0)
 
-        self.accelerator.print(f"Starting {self.phase} training for {epochs} epochs")
+        self.accelerator.print(
+            f"Starting {self.phase} training for {epochs} epochs"
+            + (f" (resuming from epoch {self.start_epoch})" if self.start_epoch else "")
+        )
 
-        for epoch in range(epochs):
+        for epoch in range(self.start_epoch, epochs):
+            self._current_epoch = epoch + 1
             self.controlnet.train()
 
             epoch_losses = []
@@ -469,16 +482,47 @@ class Trainer:
 
         return total_loss / max(n_batches, 1)
 
+    def _restore_training_state(self):
+        """optimizer / ema / lr_scheduler / step / epoch 전체 복원 (동일 학습 재개용)."""
+        resume = self.cfg["training"].get("resume")
+        if not resume or not Path(resume).exists():
+            return
+
+        ckpt = torch.load(resume, map_location="cpu", weights_only=True)
+
+        if "ema" in ckpt:
+            self.ema.load_state_dict(ckpt["ema"])
+        if "optimizer" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "lr_scheduler" in ckpt:
+            self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+
+        self.global_step   = ckpt.get("global_step", 0)
+        self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        # --start_epoch으로 수동 지정 가능 (구 checkpoint에 epoch 키 없을 때)
+        self.start_epoch   = (
+            self.cfg["training"].get("start_epoch")
+            or ckpt.get("epoch", 0)
+        )
+
+        self.accelerator.print(
+            f"Resumed from {resume} "
+            f"(epoch {self.start_epoch}, step {self.global_step})"
+        )
+
     def _save_checkpoint(self, filename: str):
         if not self.accelerator.is_main_process:
             return
         controlnet_unwrapped = self.accelerator.unwrap_model(self.controlnet)
         ckpt = {
-            "controlnet":  controlnet_unwrapped.state_dict(),
-            "ema":         self.ema.state_dict(),
-            "optimizer":   self.optimizer.state_dict(),
-            "global_step": self.global_step,
-            "config":      self.cfg,
+            "controlnet":   controlnet_unwrapped.state_dict(),
+            "ema":          self.ema.state_dict(),
+            "optimizer":    self.optimizer.state_dict(),
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "global_step":  self.global_step,
+            "epoch":        self._current_epoch,
+            "best_val_loss": self.best_val_loss,
+            "config":       self.cfg,
         }
         save_path = self.output_dir / filename
         torch.save(ckpt, save_path)

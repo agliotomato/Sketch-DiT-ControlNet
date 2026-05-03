@@ -54,9 +54,15 @@ def deep_merge(base: dict, override: dict) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--resume", default=None, help="Checkpoint path to resume training from")
+    parser.add_argument("--start_epoch", type=int, default=None, help="Resume epoch override (체크포인트에 epoch 키 없을 때)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.resume:
+        cfg["training"]["resume"] = args.resume
+    if args.start_epoch is not None:
+        cfg["training"]["start_epoch"] = args.start_epoch
     print(f"Config loaded: phase={cfg['training']['phase']}, dataset={cfg['training']['dataset']}")
 
     trainer = Trainer(cfg)

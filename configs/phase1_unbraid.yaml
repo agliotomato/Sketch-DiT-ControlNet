@@ -7,7 +7,8 @@ training:
   phase: pretrain
   dataset: unbraid          # loads unbraid_{train,test}
   epochs: 50
-  batch_size: 8             # H100 80GB 기준
+  batch_size: 4             # 40GB GPU 기준 (gradient_accumulation_steps: 2로 effective batch 8 유지)
+  gradient_accumulation_steps: 2
   learning_rate: 1.0e-4
   warmup_steps: 500
 
