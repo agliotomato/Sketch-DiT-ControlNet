@@ -43,6 +43,13 @@ class InversionLoss(nn.Module):
         w_feature_current: float | None = None,         # warm-up된 동적 가중치
     ) -> tuple[torch.Tensor, dict]:
 
+        # bfloat16 → float32 (BCE는 float32만 지원)
+        stroke_mask_pred = stroke_mask_pred.float()
+        sketch_pred      = sketch_pred.float()
+        matte_pred       = matte_pred.float()
+        sketch_gt        = sketch_gt.float()
+        matte_gt         = matte_gt.float()
+
         # stroke_mask_GT: sketch_GT에서 비배경(non-black) 픽셀
         stroke_mask_gt = (sketch_gt.max(dim=1, keepdim=True).values > 0.05).float()
 
