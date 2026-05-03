@@ -82,7 +82,7 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     base_path = cfg.pop("base", None)
     if base_path:

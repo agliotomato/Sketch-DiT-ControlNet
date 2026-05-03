@@ -141,8 +141,29 @@ class InversionTrainer:
 
         self.global_step = 0
         self.best_val_loss = float("inf")
+        self.start_epoch = 0
+        self._restore_training_state()
 
     # ------------------------------------------------------------------
+
+    def _restore_training_state(self):
+        resume = self.cfg.get("training", {}).get("resume")
+        if not resume or not Path(resume).exists():
+            return
+        ckpt = torch.load(resume, map_location="cpu", weights_only=True)
+        self.accelerator.unwrap_model(self.adapter).load_state_dict(ckpt["adapter"])
+        if "optimizer" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "lr_scheduler" in ckpt:
+            self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        self.global_step   = ckpt.get("global_step", 0)
+        self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        self.start_epoch   = (
+            self.cfg["training"].get("start_epoch") or ckpt.get("epoch", 0)
+        )
+        self.accelerator.print(
+            f"Resumed from {resume} (epoch {self.start_epoch}, step {self.global_step})"
+        )
 
     def train(self):
         tcfg   = self.cfg["training"]
@@ -150,7 +171,7 @@ class InversionTrainer:
         save_every = self.cfg["checkpointing"].get("save_every", 10)
         eval_every = self.cfg["checkpointing"].get("eval_every", 5)
 
-        for epoch in range(epochs):
+        for epoch in range(self.start_epoch, epochs):
             phase_b = (epoch >= self.phase_b_start)
 
             # feature loss warm-up: phase_b 진입 후 feature_warmup_epochs에 걸쳐 0→w_feature_max
@@ -193,6 +214,7 @@ class InversionTrainer:
                 val_loss = self._validate()
                 self.accelerator.print(f"Val loss: {val_loss:.4f}")
                 self.accelerator.log({"val_loss": val_loss, "epoch": epoch + 1}, step=self.global_step)
+                self._log_images(epoch)
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self._save("best.pth", epoch)
@@ -237,6 +259,46 @@ class InversionTrainer:
         return loss, log_dict
 
     @torch.no_grad()
+    def _log_images(self, epoch: int, n_samples: int = 4):
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            import wandb
+            import numpy as np
+        except ImportError:
+            return
+
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+        batch  = next(iter(self.val_loader))
+
+        hair_image = batch["img"][:n_samples].to(device, dtype=dtype)
+        sketch_gt  = batch["sketch"][:n_samples]
+        matte_gt   = batch["matte"][:n_samples]
+
+        self.adapter.eval()
+        sketch_pred, matte_pred, _ = self.adapter(hair_image)
+
+        def to_np(t):
+            return (t.float().cpu().numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
+
+        hair_np        = to_np(hair_image)
+        sketch_pred_np = to_np(sketch_pred)
+        sketch_gt_np   = to_np(sketch_gt)
+        matte_pred_np  = to_np(matte_pred.repeat(1, 3, 1, 1))   # 1ch → 3ch
+        matte_gt_np    = to_np(matte_gt.repeat(1, 3, 1, 1))
+
+        panels = []
+        for i in range(min(n_samples, hair_image.shape[0])):
+            panel = np.concatenate(
+                [hair_np[i], sketch_pred_np[i], sketch_gt_np[i], matte_pred_np[i], matte_gt_np[i]],
+                axis=1,
+            )
+            panels.append(wandb.Image(panel, caption=f"hair | sketch_pred | sketch_GT | matte_pred | matte_GT  (sample {i})"))
+
+        wandb.log({"val_images": panels}, step=self.global_step)
+
+    @torch.no_grad()
     def _validate(self) -> float:
         self.adapter.eval()
         device = self.accelerator.device
@@ -259,10 +321,11 @@ class InversionTrainer:
         if not self.accelerator.is_main_process:
             return
         ckpt = {
-            "adapter":      self.accelerator.unwrap_model(self.adapter).state_dict(),
-            "optimizer":    self.optimizer.state_dict(),
-            "global_step":  self.global_step,
-            "epoch":        epoch + 1,
+            "adapter":       self.accelerator.unwrap_model(self.adapter).state_dict(),
+            "optimizer":     self.optimizer.state_dict(),
+            "lr_scheduler":  self.lr_scheduler.state_dict(),
+            "global_step":   self.global_step,
+            "epoch":         epoch + 1,
             "best_val_loss": self.best_val_loss,
         }
         torch.save(ckpt, self.output_dir / filename)
