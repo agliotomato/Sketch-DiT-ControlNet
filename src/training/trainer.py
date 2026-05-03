@@ -509,6 +509,8 @@ class Trainer:
 
         if "ema" in ckpt:
             self.ema.load_state_dict(ckpt["ema"])
+            device = self.accelerator.device
+            self.ema.shadow = {k: v.to(device) for k, v in self.ema.shadow.items()}
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         if "lr_scheduler" in ckpt:
