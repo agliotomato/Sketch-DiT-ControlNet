@@ -179,3 +179,47 @@ class HairControlNet(nn.Module):
         )[0]
 
         return block_samples, null_enc_hs, null_pooled
+
+    @torch.no_grad()
+    def get_features(
+        self,
+        sketch: torch.Tensor,
+        matte: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """
+        Inversion 학습용: diffusion 없이 sketch + matte → ControlNet block_samples만 추출.
+        Feature cycle consistency loss 계산에 사용.
+
+        Args:
+            sketch: (B, 3, 512, 512) in [0, 1]
+            matte:  (B, 1, 512, 512) in [0, 1]
+        Returns:
+            block_samples: list of 12 tensors (B, 16, 64, 64)
+        """
+        B = sketch.shape[0]
+        device = sketch.device
+        dtype = sketch.dtype
+
+        sketch_latent = self._vae.encode(sketch.to(dtype=dtype)).to(device=device, dtype=dtype)
+        matte_feat    = self.matte_cnn(matte.to(device=device, dtype=dtype))
+        matte_latent  = F.interpolate(
+            matte.to(device=device, dtype=dtype), size=(64, 64), mode="bilinear", align_corners=False
+        )
+        ctrl_cond = torch.cat([sketch_latent + matte_feat, matte_latent], dim=1)  # (B, 17, 64, 64)
+
+        null_enc_hs = self.null_encoder_hidden_states.expand(B, -1, -1).to(device=device, dtype=dtype)
+        null_pooled = self.null_pooled_projections.expand(B, -1).to(device=device, dtype=dtype)
+
+        # sigma=0 dummy (no noise, conditioning-only pass)
+        dummy_latent = torch.zeros(B, 16, 64, 64, device=device, dtype=dtype)
+        dummy_sigma  = torch.zeros(B, device=device, dtype=dtype)
+
+        block_samples = self.controlnet(
+            hidden_states=dummy_latent,
+            controlnet_cond=ctrl_cond,
+            encoder_hidden_states=null_enc_hs,
+            pooled_projections=null_pooled,
+            timestep=dummy_sigma,
+            return_dict=False,
+        )[0]
+        return block_samples

@@ -1,0 +1,33 @@
+model:
+  model_id: stabilityai/stable-diffusion-3.5-medium
+  num_controlnet_layers: 12
+  controlnet_checkpoint: checkpoints/phase2_braid/final.pth   # frozen HairControlNet
+
+training:
+  dataset: both              # unbraid + braid 합쳐서 (~4000쌍)
+  epochs: 50
+  batch_size: 8
+  learning_rate: 1.0e-4
+  warmup_steps: 200
+  gradient_clip: 1.0
+  phase_b_start: 10          # feature cycle consistency 시작 epoch
+  feature_warmup_epochs: 10  # phase_b 진입 후 w_feature 0→max까지 warm-up epoch 수
+
+  loss_weights:
+    structure: 1.0
+    color: 0.5
+    matte: 1.0
+    feature: 0.1
+
+mixed_precision: bf16
+grid_size: 16                # patch color sampling 그리드 크기
+
+checkpointing:
+  output_dir: checkpoints/inversion/
+  eval_every: 5
+  save_every: 10
+
+wandb:
+  project: hair-dit
+  entity: null
+  tags: [inversion]
