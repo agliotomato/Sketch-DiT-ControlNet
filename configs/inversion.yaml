@@ -12,6 +12,8 @@ training:
   gradient_clip: 1.0
   phase_b_start: 10          # feature cycle consistency 시작 epoch
   feature_warmup_epochs: 10  # phase_b 진입 후 w_feature 0→max까지 warm-up epoch 수
+  resume: checkpoints/inversion/epoch_10.pth
+  start_epoch: 10
 
   loss_weights:
     structure: 1.0
