@@ -248,22 +248,34 @@ def collect_pairs(
 ) -> list[tuple[Path, Path | None, Path | None, str]]:
     sketch_path = Path(sketch_arg)
     if sketch_path.is_dir():
-        files = sorted(sketch_path.glob("*.png")) + sorted(sketch_path.glob("*.jpg"))
+        files = sorted(sketch_path.glob("*_sketch.png")) or \
+                sorted(sketch_path.glob("*.png")) + sorted(sketch_path.glob("*.jpg"))
         pairs = []
         for sf in files:
+            # braid_2534_sketch → braid_2534 (bare stem)
+            bare = sf.stem.replace("_sketch", "")
             mf = ff = None
-            for arg, ref in ((matte_arg, "mf"), (face_arg, "ff")):
-                if arg:
-                    mp = Path(arg)
-                    for ext in (".png", ".jpg"):
-                        candidate = mp / (sf.stem + ext)
-                        if candidate.exists():
-                            if ref == "mf":
-                                mf = candidate
-                            else:
-                                ff = candidate
+            if matte_arg:
+                mp = Path(matte_arg)
+                for ext in (".png", ".jpg"):
+                    for cand_stem in (bare + "_matte", bare, sf.stem):
+                        c = mp / (cand_stem + ext)
+                        if c.exists():
+                            mf = c
                             break
-            pairs.append((sf, mf, ff, sf.stem))
+                    if mf:
+                        break
+            if face_arg:
+                fp = Path(face_arg)
+                for ext in (".png", ".jpg"):
+                    for cand_stem in (bare, sf.stem):
+                        c = fp / (cand_stem + ext)
+                        if c.exists():
+                            ff = c
+                            break
+                    if ff:
+                        break
+            pairs.append((sf, mf, ff, bare))
         return pairs
     else:
         mf = Path(matte_arg) if matte_arg else None
