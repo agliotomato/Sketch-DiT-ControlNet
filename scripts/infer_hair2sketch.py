@@ -47,9 +47,19 @@ def load_image(path: Path, size: int = 512) -> torch.Tensor:
 
 @torch.no_grad()
 def infer(adapter, hair_image: torch.Tensor, device, dtype):
+    from src.models.inversion_adapter import patch_color_sample
     hair = hair_image.to(device=device, dtype=dtype)
-    sketch_pred, matte_pred, _ = adapter(hair)
-    return sketch_pred.float().clamp(0, 1), matte_pred.float().clamp(0, 1)
+    _, matte_pred, stroke_mask = adapter(hair)
+
+    # stroke_mask 정규화: 이미지별 max=1로 스케일 → 어두운 출력 방지
+    stroke_max = stroke_mask.amax(dim=[2, 3], keepdim=True).clamp(min=1e-8)
+    stroke_norm = stroke_mask / stroke_max
+
+    # matte로 constrain 후 색 샘플링
+    constrained = stroke_norm * matte_pred
+    sketch_pred = patch_color_sample(hair.float(), constrained.float(), adapter.grid_size)
+
+    return sketch_pred.clamp(0, 1), matte_pred.float().clamp(0, 1)
 
 
 def main():
