@@ -503,23 +503,59 @@ class InverseHeadTrainer:
         self.model.eval()
         sketch_pred, matte_pred, _ = self.model(hair_image)
 
+        # Phase 2: also compute hair_recon for cycle visualization
+        log_recon = (epoch >= self.cycle_start) and (self.lpips_fn is not None)
+        if log_recon:
+            sketch_latent = self.vae.encode_for_grad(sketch_pred.float()).to(dtype=torch.bfloat16)
+            B = sketch_latent.shape[0]
+            null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
+            null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=torch.bfloat16)
+            sigma    = torch.zeros(B, device=device, dtype=torch.bfloat16)
+            pred_lat = self.transformer(
+                hidden_states=sketch_latent,
+                encoder_hidden_states=null_enc,
+                pooled_projections=null_p,
+                timestep=sigma,
+                return_dict=False,
+            )[0]
+            hair_recon = self.vae.decode(pred_lat)               # [-1, 1]
+            hair_recon = VAEWrapper.denormalize(hair_recon).clamp(0, 1)
+
         def to_np(t):
             return (t.float().cpu().numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
 
         panels = []
+        cap = "hair | sketch_pred | sketch_GT | matte_pred | matte_GT"
+        if log_recon:
+            cap += " | hair_recon (cycle)"
         for i in range(min(n_samples, hair_image.shape[0])):
-            panel = np.concatenate([
+            cols = [
                 to_np(hair_image)[i],
                 to_np(sketch_pred)[i],
                 to_np(sketch_gt)[i],
                 to_np(matte_pred.repeat(1, 3, 1, 1))[i],
                 to_np(matte_gt.repeat(1, 3, 1, 1))[i],
-            ], axis=1)
-            panels.append(wandb.Image(
-                panel,
-                caption=f"hair | sketch_pred | sketch_GT | matte_pred | matte_GT  ({i})"
-            ))
+            ]
+            if log_recon:
+                cols.append(to_np(hair_recon)[i])
+            panel = np.concatenate(cols, axis=1)
+            panels.append(wandb.Image(panel, caption=f"{cap}  ({i})"))
         wandb.log({"val_images": panels}, step=self.global_step)
+
+        # Block importance bar chart: which DiT blocks dominate each scale?
+        # Useful for verifying that back_blocks (12-23) become more dominant after unfreeze.
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        block_imp = unwrapped.feature_extractor.get_block_importance()
+        for scale, w in block_imp.items():
+            data = [[i, float(w[i])] for i in range(w.shape[0])]
+            table = wandb.Table(data=data, columns=["block", "weight"])
+            wandb.log(
+                {f"block_importance/{scale}": wandb.plot.bar(
+                    table, "block", "weight",
+                    title=f"DiT Block Importance — {scale}",
+                )},
+                step=self.global_step,
+            )
 
     def _save(self, filename: str, epoch: int):
         if not self.accelerator.is_main_process:
