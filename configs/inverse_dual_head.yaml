@@ -1,0 +1,25 @@
+# Inverse ControlNet + SketchDecoderHead cycle (Option A+B combined)
+#
+# Inherits inverse_controlnet.yaml (hair → DiT → sketch, full diffusion).
+# Adds SketchDecoderHead for O(1) cycle signal from epoch 0:
+#   block_samples → decoder head → sketch_pred → L1 vs sketch_gt
+# Replaces the expensive x_0 → VAE decode → forward ControlNet cycle path.
+
+base: configs/inverse_controlnet.yaml
+
+model:
+  use_sketch_decoder: true
+
+training:
+  loss_weights:
+    flow: 1.0
+    lpips: 0.05
+    lpips_warmup_frac: 0.3
+    edge: 0.0
+    cycle: 0.1              # decoder head cycle loss weight (L1, stroke-weighted)
+    sketch_decoder: 0.0     # no separate recon loss in inverse mode
+
+  cycle_start: 0            # decoder head is O(1) — start from epoch 0
+
+checkpointing:
+  output_dir: checkpoints/inverse_dual_head/

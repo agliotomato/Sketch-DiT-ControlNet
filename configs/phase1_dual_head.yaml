@@ -1,0 +1,21 @@
+# Phase 1 pretrain + SketchDecoderHead (Option A, forward direction)
+#
+# ControlNet block_samples → SketchDecoderHead → sketch_pred (O(1))
+# Auxiliary sketch reconstruction loss forces ControlNet features to encode sketch structure,
+# improving forward→inverse transfer when the decoder head is reused for cycle loss.
+
+base: configs/phase1_unbraid.yaml
+
+model:
+  use_sketch_decoder: true
+
+training:
+  loss_weights:
+    flow: 1.0
+    lpips: 0.1
+    lpips_warmup_frac: 0.3
+    edge: 0.0
+    sketch_decoder: 0.2     # auxiliary sketch recon weight
+
+checkpointing:
+  output_dir: checkpoints/phase1_dual_head/

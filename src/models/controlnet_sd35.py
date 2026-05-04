@@ -62,6 +62,58 @@ class MatteCNN(nn.Module):
         return self.net(matte)
 
 
+class SketchDecoderHead(nn.Module):
+    """
+    Lightweight decoder: 12 ControlNet block_samples → sketch (B, 3, 512, 512).
+
+    block_samples shape: list of (B, seq_len, 1152)  — SD3 sequence format.
+    Image tokens are the first spatial_size² entries (32×32=1024 for 512px input).
+    """
+
+    def __init__(self, num_blocks: int = 12, hidden_dim: int = 1152, image_tokens: int = 1024):
+        super().__init__()
+        self.spatial_size = int(image_tokens ** 0.5)  # 32
+        self.num_tokens   = image_tokens
+
+        self.block_weights = nn.Parameter(torch.zeros(num_blocks))
+
+        # 32×32 → 512×512 via 4× bilinear upsample (32→64→128→256→512)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(hidden_dim, 256, 1),
+            nn.GroupNorm(32, 256), nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(256, 128, 3, padding=1), nn.GroupNorm(16, 128), nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(64, 32, 3, padding=1), nn.GroupNorm(4, 32), nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(32, 3, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, block_samples: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            block_samples: list of N × (B, seq_len, hidden_dim) tensors
+        Returns:
+            sketch_pred: (B, 3, 512, 512) in [0, 1]
+        """
+        weights = self.block_weights.softmax(dim=0)  # (N,)
+        # Weighted sum over blocks; slice first image_tokens along seq dim
+        agg = sum(
+            w * b[:, : self.num_tokens, :]
+            for w, b in zip(weights, block_samples)
+        )  # (B, image_tokens, hidden_dim)
+
+        B = agg.shape[0]
+        S = self.spatial_size
+        # Reshape to spatial (B, hidden_dim, S, S) — cast to float32 for conv stability
+        spatial = agg.reshape(B, S, S, -1).permute(0, 3, 1, 2).to(dtype=torch.float32)
+        out = self.decoder(spatial)  # (B, 3, 512, 512) float32
+        return out.to(dtype=agg.dtype)
+
+
 class HairControlNet(nn.Module):
     """
     SD3.5 ControlNet model for hair region synthesis.
@@ -86,6 +138,7 @@ class HairControlNet(nn.Module):
         vae: VAEWrapper,
         num_layers: int = 12,
         local_files_only: bool = False,
+        use_sketch_decoder: bool = False,
     ):
         super().__init__()
 
@@ -111,6 +164,10 @@ class HairControlNet(nn.Module):
         torch.cuda.empty_cache()
 
         self.matte_cnn = MatteCNN()
+
+        self.sketch_decoder: SketchDecoderHead | None = (
+            SketchDecoderHead() if use_sketch_decoder else None
+        )
 
         # Learned null text conditioning (trained alongside ControlNet)
         self.null_encoder_hidden_states = nn.Parameter(
@@ -180,41 +237,35 @@ class HairControlNet(nn.Module):
 
         return block_samples, null_enc_hs, null_pooled
 
-    @torch.no_grad()
-    def get_features(
+    def _get_features_impl(
         self,
-        sketch: torch.Tensor,
+        condition_image: torch.Tensor,
         matte: torch.Tensor,
     ) -> list[torch.Tensor]:
         """
-        Inversion 학습용: diffusion 없이 sketch + matte → ControlNet block_samples만 추출.
-        Feature cycle consistency loss 계산에 사용.
+        조건 이미지 → ControlNet block_samples 추출 (공유 구현).
 
-        Args:
-            sketch: (B, 3, 512, 512) in [0, 1]
-            matte:  (B, 1, 512, 512) in [0, 1]
-        Returns:
-            block_samples: list of 12 tensors (B, 16, 64, 64)
+        condition_image: (B, 3, 512, 512) — sketch (inversion용) 또는 hair image (cycle loss용)
+        matte:           (B, 1, 512, 512)
         """
-        B = sketch.shape[0]
-        device = sketch.device
-        dtype = sketch.dtype
+        B = condition_image.shape[0]
+        device = condition_image.device
+        dtype = condition_image.dtype
 
-        sketch_latent = self._vae.encode(sketch.to(dtype=dtype)).to(device=device, dtype=dtype)
-        matte_feat    = self.matte_cnn(matte.to(device=device, dtype=dtype))
-        matte_latent  = F.interpolate(
+        cond_latent  = self._vae.encode(condition_image.to(dtype=dtype)).to(device=device, dtype=dtype)
+        matte_feat   = self.matte_cnn(matte.to(device=device, dtype=dtype))
+        matte_latent = F.interpolate(
             matte.to(device=device, dtype=dtype), size=(64, 64), mode="bilinear", align_corners=False
         )
-        ctrl_cond = torch.cat([sketch_latent + matte_feat, matte_latent], dim=1)  # (B, 17, 64, 64)
+        ctrl_cond = torch.cat([cond_latent + matte_feat, matte_latent], dim=1)  # (B, 17, 64, 64)
 
         null_enc_hs = self.null_encoder_hidden_states.expand(B, -1, -1).to(device=device, dtype=dtype)
         null_pooled = self.null_pooled_projections.expand(B, -1).to(device=device, dtype=dtype)
 
-        # sigma=0 dummy (no noise, conditioning-only pass)
         dummy_latent = torch.zeros(B, 16, 64, 64, device=device, dtype=dtype)
         dummy_sigma  = torch.zeros(B, device=device, dtype=dtype)
 
-        block_samples = self.controlnet(
+        return self.controlnet(
             hidden_states=dummy_latent,
             controlnet_cond=ctrl_cond,
             encoder_hidden_states=null_enc_hs,
@@ -222,4 +273,15 @@ class HairControlNet(nn.Module):
             timestep=dummy_sigma,
             return_dict=False,
         )[0]
-        return block_samples
+
+    @torch.no_grad()
+    def get_features(
+        self,
+        sketch: torch.Tensor,
+        matte: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """
+        Inversion Phase B용: sketch + matte → block_samples (gradient 없음).
+        Cycle self-distillation에서 gradient가 필요하면 _get_features_impl() 직접 호출.
+        """
+        return self._get_features_impl(sketch, matte)

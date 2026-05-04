@@ -1,0 +1,392 @@
+"""
+InverseHeadTrainer: Hair→Sketch via frozen DiT internal features + trainable FPN mask decoder.
+
+Trainable:
+  - HairToSketchDiT.feature_extractor.lora_modules  (LoRA on 3 DiT blocks)
+  - HairToSketchDiT.stroke_decoder  (FPNMaskDecoder)
+  - HairToSketchDiT.matte_decoder   (FPNMaskDecoder)
+
+Frozen:
+  - SD3.5 DiT (base weights)
+  - VAE encoder/decoder
+
+Loss: InversionLoss (structure BCE + color L1 + matte BCE+Dice) + TV Loss on stroke_mask.
+Two-phase training (교수님 지시):
+  Phase 1 (0 ~ cycle_start): supervised mask/matte/color only
+  Phase 2 (cycle_start ~):   + cycle loss w=0.01 via frozen forward ControlNet
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+from accelerate import Accelerator
+from diffusers import SD3Transformer2DModel
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import ConcatDataset, DataLoader
+from tqdm import tqdm
+
+from src.data.augmentation import build_augmentation_pipeline
+from src.data.dataset import HairRegionDataset
+from src.models.controlnet_sd35 import HairControlNet
+from src.models.inverse_head import HairToSketchDiT
+from src.models.vae_wrapper import VAEWrapper
+from src.training.losses_inversion import InversionLoss, tv_loss
+import torch.nn.functional as F
+
+
+class InverseHeadTrainer:
+    def __init__(self, config: dict):
+        self.cfg  = config
+        tcfg      = config["training"]
+
+        self.accelerator = Accelerator(
+            mixed_precision=config.get("mixed_precision", "bf16"),
+            log_with=["tensorboard", "wandb"],
+            project_dir=config["checkpointing"]["output_dir"],
+        )
+
+        model_id        = config["model"]["model_id"]
+        local_only      = config.get("local_files_only", False)
+        controlnet_ckpt = config["model"]["controlnet_checkpoint"]
+
+        # --- Frozen VAE ---
+        self.vae = VAEWrapper.from_pretrained(
+            model_id=model_id, torch_dtype=torch.bfloat16, local_files_only=local_only,
+        ).eval()
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+
+        # --- Frozen DiT (base weights; LoRA will be injected inside HairToSketchDiT) ---
+        self.transformer = SD3Transformer2DModel.from_pretrained(
+            model_id, subfolder="transformer",
+            torch_dtype=torch.bfloat16, local_files_only=local_only,
+        )
+        for p in self.transformer.parameters():
+            p.requires_grad_(False)
+        self.transformer.eval()
+
+        # --- Frozen forward ControlNet (for Phase 2 cycle loss) ---
+        self.forward_controlnet: HairControlNet | None = None
+        self.w_cycle    = tcfg["loss_weights"].get("cycle", 0.0)
+        self.cycle_start = tcfg.get("cycle_start", 9999)
+        if self.w_cycle > 0 and Path(controlnet_ckpt).exists():
+            fwd_cn = HairControlNet(
+                model_id=model_id, vae=self.vae,
+                num_layers=config["model"].get("num_controlnet_layers", 12),
+                local_files_only=local_only,
+            )
+            ckpt = torch.load(controlnet_ckpt, map_location="cpu", weights_only=True)
+            fwd_cn.load_state_dict(ckpt["controlnet"])
+            fwd_cn.eval()
+            for p in fwd_cn.parameters():
+                p.requires_grad_(False)
+            self.forward_controlnet = fwd_cn
+
+        # --- Trainable model: LoRA + FPN decoders ---
+        # Reuse null embeddings from forward ControlNet (already trained)
+        # If no forward ControlNet loaded, create placeholder (will be learned)
+        if self.forward_controlnet is not None:
+            null_enc_hs = self.forward_controlnet.null_encoder_hidden_states.detach()
+            null_pooled = self.forward_controlnet.null_pooled_projections.detach()
+        else:
+            null_enc_hs = torch.zeros(1, 333, 4096, dtype=torch.bfloat16)
+            null_pooled = torch.zeros(1, 2048, dtype=torch.bfloat16)
+
+        lora_cfg = config.get("lora", {})
+        self.model = HairToSketchDiT(
+            transformer=self.transformer,
+            vae=self.vae,
+            null_enc_hs=null_enc_hs,
+            null_pooled=null_pooled,
+            lora_rank=lora_cfg.get("rank", 8),
+            lora_alpha=lora_cfg.get("alpha", 8.0),
+            grid_size=config.get("grid_size", 16),
+        )
+
+        # --- Data ---
+        aug = build_augmentation_pipeline("pretrain")
+        train_ds = ConcatDataset([
+            HairRegionDataset(split=s, augmentation=aug)
+            for s in ("unbraid_train", "braid_train")
+        ])
+        val_ds = ConcatDataset([
+            HairRegionDataset(split=s)
+            for s in ("unbraid_test", "braid_test")
+        ])
+
+        bs = tcfg.get("batch_size", 4)
+        self.train_loader = DataLoader(
+            train_ds, batch_size=bs, shuffle=True,
+            num_workers=4, pin_memory=True, drop_last=True,
+        )
+        self.val_loader = DataLoader(
+            val_ds, batch_size=bs, shuffle=False,
+            num_workers=4, pin_memory=True,
+        )
+
+        # --- Optimizer: only trainable params (LoRA + decoders) ---
+        self.optimizer = AdamW(
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=tcfg.get("learning_rate", 1e-4),
+            betas=(0.9, 0.999),
+            weight_decay=1e-2,
+        )
+        total_steps  = tcfg.get("epochs", 50) * len(self.train_loader)
+        warmup_steps = tcfg.get("warmup_steps", 200)
+        self.warmup_steps = warmup_steps
+        self.lr_scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-6,
+        )
+
+        # --- Loss ---
+        lw = tcfg.get("loss_weights", {})
+        self.loss_fn  = InversionLoss(
+            w_structure=lw.get("structure", 1.0),
+            w_color=lw.get("color", 0.5),
+            w_matte=lw.get("matte", 1.0),
+        )
+        self.w_tv     = lw.get("tv", 0.01)
+
+        self.output_dir = Path(config["checkpointing"]["output_dir"])
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Accelerate prepare ---
+        (
+            self.model,
+            self.optimizer,
+            self.train_loader,
+            self.val_loader,
+            self.lr_scheduler,
+        ) = self.accelerator.prepare(
+            self.model, self.optimizer,
+            self.train_loader, self.val_loader,
+            self.lr_scheduler,
+        )
+        device = self.accelerator.device
+        self.vae         = self.vae.to(device)
+        self.transformer = self.transformer.to(device)
+        if self.forward_controlnet is not None:
+            self.forward_controlnet = self.forward_controlnet.to(device)
+
+        wcfg = config.get("wandb", {})
+        self.accelerator.init_trackers(
+            project_name=wcfg.get("project", "hair-dit"),
+            config=_flatten(config),
+            init_kwargs={"wandb": {
+                "name": "inverse_head_dit",
+                "entity": wcfg.get("entity") or None,
+                "tags": ["inverse", "dit_features", "fpn", "lora"],
+                "config": config,
+            }},
+        )
+
+        self.global_step   = 0
+        self.best_val_loss = float("inf")
+        self.start_epoch   = 0
+        self._current_epoch = 0
+        self._restore_training_state()
+
+    def _restore_training_state(self):
+        resume = self.cfg.get("training", {}).get("resume")
+        if not resume or not Path(resume).exists():
+            return
+        ckpt = torch.load(resume, map_location="cpu", weights_only=True)
+        self.accelerator.unwrap_model(self.model).load_state_dict(ckpt["model"])
+        if "optimizer"    in ckpt: self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "lr_scheduler" in ckpt: self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        self.global_step    = ckpt.get("global_step", 0)
+        self.best_val_loss  = ckpt.get("best_val_loss", float("inf"))
+        self.start_epoch    = self.cfg["training"].get("start_epoch") or ckpt.get("epoch", 0)
+        self.accelerator.print(
+            f"Resumed from {resume} (epoch {self.start_epoch}, step {self.global_step})"
+        )
+
+    def train(self):
+        tcfg       = self.cfg["training"]
+        epochs     = tcfg.get("epochs", 50)
+        save_every = self.cfg["checkpointing"].get("save_every", 10)
+        eval_every = self.cfg["checkpointing"].get("eval_every", 5)
+
+        for epoch in range(self.start_epoch, epochs):
+            self._current_epoch = epoch
+            phase2 = (epoch >= self.cycle_start)
+
+            self.model.train()
+            epoch_losses = []
+
+            desc = f"Epoch {epoch+1}/{epochs}" + (" [+cycle]" if phase2 else "")
+            progress = tqdm(
+                self.train_loader, desc=desc,
+                disable=not self.accelerator.is_local_main_process,
+            )
+
+            for batch in progress:
+                loss, log_dict = self._train_step(batch, phase2=phase2)
+                epoch_losses.append(log_dict["loss_total"])
+
+                if self.global_step < self.warmup_steps:
+                    lr_scale = min(1.0, (self.global_step + 1) / max(self.warmup_steps, 1))
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = tcfg["learning_rate"] * lr_scale
+                else:
+                    self.lr_scheduler.step()
+
+                self.global_step += 1
+                progress.set_postfix({k: f"{v:.4f}" for k, v in log_dict.items()})
+                self.accelerator.log(log_dict, step=self.global_step)
+
+            avg = sum(epoch_losses) / len(epoch_losses)
+            self.accelerator.print(f"Epoch {epoch+1} avg loss: {avg:.4f}")
+
+            if (epoch + 1) % eval_every == 0:
+                val_loss = self._validate()
+                self.accelerator.print(f"Val loss: {val_loss:.4f}")
+                self.accelerator.log({"val_loss": val_loss, "epoch": epoch + 1}, step=self.global_step)
+                self._log_images(epoch)
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self._save("best.pth", epoch)
+
+            if (epoch + 1) % save_every == 0:
+                self._save(f"epoch_{epoch+1}.pth", epoch)
+
+        self._save("final.pth", epochs - 1)
+        self.accelerator.end_training()
+
+    def _train_step(self, batch: dict, phase2: bool = False) -> tuple[torch.Tensor, dict]:
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+
+        hair_image = batch["img"].to(device, dtype=dtype)
+        sketch_gt  = batch["sketch"].to(device, dtype=dtype)
+        matte_gt   = batch["matte"].to(device, dtype=dtype)
+
+        self.optimizer.zero_grad()
+
+        sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
+
+        # Phase 1: supervised loss only
+        loss, log_dict = self.loss_fn(
+            stroke_mask_pred=stroke_mask,
+            sketch_pred=sketch_pred,
+            matte_pred=matte_pred,
+            sketch_gt=sketch_gt,
+            matte_gt=matte_gt,
+        )
+
+        # TV loss: smooth stroke mask (no abrupt breaks)
+        l_tv = tv_loss(stroke_mask.float())
+        loss = loss + self.w_tv * l_tv
+        log_dict["loss_tv"] = l_tv.item()
+
+        # Phase 2: cycle loss via frozen forward ControlNet (w=0.01)
+        if phase2 and self.forward_controlnet is not None:
+            block_pred = self.forward_controlnet._get_features_impl(
+                sketch_pred.float(), matte_gt.float()
+            )
+            with torch.no_grad():
+                block_gt = self.forward_controlnet._get_features_impl(
+                    sketch_gt.float(), matte_gt.float()
+                )
+            cycle = sum(
+                F.mse_loss(bp, bg.detach())
+                for bp, bg in zip(block_pred, block_gt)
+            ) / len(block_pred)
+            loss = loss + self.w_cycle * cycle
+            log_dict["loss_cycle"] = cycle.item()
+
+        self.accelerator.backward(loss)
+        if self.cfg["training"].get("gradient_clip"):
+            self.accelerator.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad],
+                self.cfg["training"]["gradient_clip"],
+            )
+        self.optimizer.step()
+        return loss, log_dict
+
+    @torch.no_grad()
+    def _validate(self) -> float:
+        self.model.eval()
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+        total, n = 0.0, 0
+
+        for batch in self.val_loader:
+            hair_image = batch["img"].to(device, dtype=dtype)
+            sketch_gt  = batch["sketch"].to(device, dtype=dtype)
+            matte_gt   = batch["matte"].to(device, dtype=dtype)
+
+            sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
+            _, log = self.loss_fn(stroke_mask, sketch_pred, matte_pred, sketch_gt, matte_gt)
+            total += log["loss_total"]
+            n += 1
+
+        return total / max(n, 1)
+
+    @torch.no_grad()
+    def _log_images(self, epoch: int, n_samples: int = 4):
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            import wandb, numpy as np
+        except ImportError:
+            return
+
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+        batch  = next(iter(self.val_loader))
+
+        hair_image = batch["img"][:n_samples].to(device, dtype=dtype)
+        sketch_gt  = batch["sketch"][:n_samples]
+        matte_gt   = batch["matte"][:n_samples]
+
+        self.model.eval()
+        sketch_pred, matte_pred, _ = self.model(hair_image)
+
+        def to_np(t):
+            return (t.float().cpu().numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
+
+        panels = []
+        for i in range(min(n_samples, hair_image.shape[0])):
+            panel = np.concatenate([
+                to_np(hair_image)[i],
+                to_np(sketch_pred)[i],
+                to_np(sketch_gt)[i],
+                to_np(matte_pred.repeat(1, 3, 1, 1))[i],
+                to_np(matte_gt.repeat(1, 3, 1, 1))[i],
+            ], axis=1)
+            panels.append(wandb.Image(
+                panel,
+                caption=f"hair | sketch_pred | sketch_GT | matte_pred | matte_GT  ({i})"
+            ))
+        wandb.log({"val_images": panels}, step=self.global_step)
+
+    def _save(self, filename: str, epoch: int):
+        if not self.accelerator.is_main_process:
+            return
+        ckpt = {
+            "model":         self.accelerator.unwrap_model(self.model).state_dict(),
+            "optimizer":     self.optimizer.state_dict(),
+            "lr_scheduler":  self.lr_scheduler.state_dict(),
+            "global_step":   self.global_step,
+            "epoch":         epoch + 1,
+            "best_val_loss": self.best_val_loss,
+        }
+        torch.save(ckpt, self.output_dir / filename)
+        self.accelerator.print(f"Saved: {self.output_dir / filename}")
+
+
+def _flatten(cfg: dict, prefix: str = "") -> dict:
+    out = {}
+    for k, v in cfg.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten(v, key))
+        elif isinstance(v, (int, float, str, bool)):
+            out[key] = v
+        else:
+            out[key] = str(v)
+    return out

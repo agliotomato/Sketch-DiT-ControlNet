@@ -202,9 +202,10 @@ class HairInversionAdapter(nn.Module):
         matte_pred  = self.matte_dec(features)   # (B, 1, 512, 512)
 
         # 4. Non-parametric color sampling
-        #    stroke_mask를 matte_pred로 constrain → 배경에 선 긋지 않도록
+        #    matte_pred로 색 샘플 소스(hair 영역)를 마스킹, stroke_mask만 단독으로 출력 강도 제어
+        #    (이중 sigmoid 곱을 피해 stroke 색의 감쇠를 방지)
         target = hair_image.to(device=device, dtype=dtype)
-        constrained_mask = stroke_mask * matte_pred  # 헤어 영역 밖 stroke 억제
-        sketch_pred = patch_color_sample(target, constrained_mask, self.grid_size)  # (B, 3, 512, 512)
+        hair_masked = target * matte_pred  # 색 소스: hair 영역만
+        sketch_pred = patch_color_sample(hair_masked, stroke_mask, self.grid_size)  # (B, 3, 512, 512)
 
         return sketch_pred, matte_pred, stroke_mask

@@ -1,0 +1,47 @@
+# Option B: Inverse ControlNet — Hair → Sketch
+#
+# condition swap: hair image → ControlNet → SD3.5 DiT → sketch
+# 기존 HairControlNet 구조 그대로 재활용, condition/target만 교체.
+#
+# Phase A (direct supervision):
+#   cond = hair photo,  target = sketch
+#   loss = flow(stroke-weighted) + LPIPS
+#
+# Phase B (cycle self-distillation, cycle_start 이후):
+#   x0_pred (predicted sketch) → frozen forward ControlNet → block_features
+#   cycle_loss = MSE(block_features_pred, block_features_gt_sketch)
+#   → inverse ControlNet이 "forward model이 올바르게 읽을 수 있는 sketch"를 생성하도록 유도
+
+base: configs/base.yaml
+
+model:
+  model_id: stabilityai/stable-diffusion-3.5-medium
+  num_controlnet_layers: 12
+
+training:
+  mode: inverse             # condition swap: hair → sketch
+  phase: pretrain           # pretrain 로직 재사용 (2단계 커리큘럼 불필요)
+  dataset: both             # unbraid + braid 전체 (4K 쌍)
+  epochs: 50
+  batch_size: 2
+  gradient_accumulation_steps: 4   # effective batch 8
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+
+  loss_weights:
+    flow: 1.0
+    lpips: 0.05              # sketch는 sparse — LPIPS 가중치 낮춤
+    lpips_warmup_frac: 0.3
+    edge: 0.0                # edge loss 비활성화 (sketch를 생성하는 것 자체가 목표)
+    cycle: 0.05              # Phase B cycle self-distillation 가중치
+
+  # Phase B: cycle self-distillation 시작 epoch
+  cycle_start: 20            # 20 epoch 직접지도 후 cycle loss 추가
+
+  # 순방향 ControlNet checkpoint (cycle loss용, frozen)
+  forward_checkpoint: checkpoints/phase2_braid/final.pth
+
+checkpointing:
+  output_dir: checkpoints/inverse_controlnet/
+  eval_every: 5
+  save_every: 10

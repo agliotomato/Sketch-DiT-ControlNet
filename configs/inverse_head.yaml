@@ -1,0 +1,47 @@
+# Inverse Head: DiT Feature Extraction + FPN Mask Decoder
+#
+# Data flow:
+#   hair_image → frozen VAE encoder → frozen DiT (+ LoRA) → {early, mid, late} features
+#   features → FPNMaskDecoder → stroke_mask + matte_pred
+#   hair * matte → patch_color_sample(stroke_mask) → sketch_pred
+#
+# No image generation decoder. No VAE decoder output.
+# Two-phase training:
+#   Phase 1 (epoch 0~cycle_start): supervised (structure + color + matte + TV)
+#   Phase 2 (epoch cycle_start~): + cycle loss w=0.01 via frozen forward ControlNet
+
+base: configs/base.yaml
+
+model:
+  model_id: stabilityai/stable-diffusion-3.5-medium
+  num_controlnet_layers: 12
+  controlnet_checkpoint: checkpoints/phase2_braid/final.pth
+
+lora:
+  rank: 8         # LoRA rank for DiT attention (to_q/to_k/to_v of all 24 blocks)
+  alpha: 8.0      # LoRA scaling factor
+
+training:
+  epochs: 50
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  warmup_steps: 200
+  gradient_clip: 1.0
+
+  # Phase 2: cycle loss 시작 epoch
+  cycle_start: 20   # Phase 1 (supervised) 충분히 학습 후 cycle 추가
+
+  loss_weights:
+    structure: 1.0    # BCE: stroke_mask vs GT
+    color: 0.5        # L1 stroke-weighted: sketch_pred vs sketch_GT
+    matte: 1.0        # BCE + L1 + Dice: matte_pred vs matte_GT
+    tv: 0.01          # Total Variation: stroke mask smoothness
+    cycle: 0.01       # Phase 2: forward ControlNet feature MSE
+
+grid_size: 16         # patch color sampling 크기
+
+checkpointing:
+  output_dir: checkpoints/inverse_head/
+  eval_every: 5
+  save_every: 10

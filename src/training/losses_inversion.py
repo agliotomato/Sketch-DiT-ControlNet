@@ -56,8 +56,9 @@ class InversionLoss(nn.Module):
         # --- Phase A losses ---
         l_structure = F.binary_cross_entropy(stroke_mask_pred, stroke_mask_gt)
 
-        # L_color: stroke 영역에서만 L1 (배경 오차 무시)
-        l_color = (F.l1_loss(sketch_pred, sketch_gt, reduction="none") * stroke_mask_gt).mean()
+        # L_color: stroke 영역 픽셀 수로 나눠 sparse mask 희석 방지
+        n_stroke = stroke_mask_gt.sum().clamp(min=1)
+        l_color = (F.l1_loss(sketch_pred, sketch_gt, reduction="none") * stroke_mask_gt).sum() / n_stroke
 
         # Matte loss: BCE + L1 + Dice
         # 입력이 전체 사진이므로 배경→0을 강하게 밀어내야 함
@@ -95,3 +96,10 @@ class InversionLoss(nn.Module):
 
         log["loss_total"] = total.item()
         return total, log
+
+
+def tv_loss(mask: torch.Tensor) -> torch.Tensor:
+    """Total Variation loss: penalizes abrupt mask discontinuities → smoother strokes."""
+    diff_h = (mask[:, :, 1:, :] - mask[:, :, :-1, :]).abs().mean()
+    diff_w = (mask[:, :, :, 1:] - mask[:, :, :, :-1]).abs().mean()
+    return diff_h + diff_w

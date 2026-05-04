@@ -36,6 +36,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
 from torch.optim import AdamW
@@ -80,6 +81,13 @@ class Trainer:
         self.cfg = config
         self.phase = config["training"]["phase"]
         assert self.phase in ("pretrain", "finetune"), f"Unknown phase: {self.phase}"
+
+        # Inverse task self-distillation
+        self.inverse_mode = config["training"].get("mode", "forward") == "inverse"
+        self.w_cycle      = config["training"]["loss_weights"].get("cycle", 0.0)
+        self.cycle_start  = config["training"].get("cycle_start", 9999)
+        self.w_sketch_dec = config["training"]["loss_weights"].get("sketch_decoder", 0.0)
+        self.forward_controlnet: Optional[HairControlNet] = None
 
         self.accelerator = Accelerator(
             mixed_precision=config["training"].get("mixed_precision", "bf16"),
@@ -172,6 +180,7 @@ class Trainer:
             vae=self.vae,
             num_layers=num_layers,
             local_files_only=local_files_only,
+            use_sketch_decoder=cfg["model"].get("use_sketch_decoder", False),
         )
 
         # Gradient checkpointing: saves ~40% activation memory at ~20% compute cost
@@ -187,6 +196,26 @@ class Trainer:
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
+
+        # Inverse mode: load frozen forward ControlNet for cycle self-distillation
+        if self.inverse_mode and self.w_cycle > 0.0:
+            fwd_ckpt = cfg["training"].get("forward_checkpoint")
+            if fwd_ckpt and Path(fwd_ckpt).exists():
+                fwd_controlnet = HairControlNet(
+                    model_id=model_id,
+                    vae=self.vae,
+                    num_layers=num_layers,
+                    local_files_only=local_files_only,
+                )
+                ckpt = torch.load(fwd_ckpt, map_location="cpu", weights_only=True)
+                fwd_controlnet.load_state_dict(ckpt["controlnet"])
+                for p in fwd_controlnet.parameters():
+                    p.requires_grad_(False)
+                fwd_controlnet.eval()
+                self.forward_controlnet = fwd_controlnet
+                self.accelerator.print(f"[Cycle] Loaded frozen forward ControlNet from {fwd_ckpt}")
+            else:
+                self.accelerator.print("[Cycle] forward_checkpoint not found — cycle loss disabled")
 
         # Phase 2 weight transfer (Phase 1 → Phase 2, controlnet only)
         resume_from = cfg["training"].get("resume_from")
@@ -361,9 +390,19 @@ class Trainer:
         self.accelerator.end_training()
 
     def _train_step(self, batch: dict, grad_clip: float = 1.0) -> tuple[torch.Tensor, dict]:
-        sketch = batch["sketch"]   # (B, 3, 512, 512) [0,1]
-        matte  = batch["matte"]    # (B, 1, 512, 512) [0,1]
-        target = batch["target"]   # (B, 3, 512, 512) [0,1]
+        matte = batch["matte"]   # (B, 1, 512, 512) [0,1]
+
+        # Forward mode: sketch → hair  |  Inverse mode: hair → sketch
+        if self.inverse_mode:
+            cond_image  = batch["img"]      # full hair photo as conditioning signal
+            target      = batch["sketch"]   # generate sketch
+            # Weight flow loss on stroke regions (non-black sketch pixels)
+            stroke_mask = (target.mean(dim=1, keepdim=True) > 0.05).float()
+            loss_mask   = stroke_mask
+        else:
+            cond_image  = batch["sketch"]   # sketch as conditioning signal
+            target      = batch["target"]   # generate hair region (img × matte)
+            loss_mask   = matte
 
         with self.accelerator.accumulate(self.controlnet):
             device = self.accelerator.device
@@ -380,22 +419,22 @@ class Trainer:
             noise = torch.randn_like(latents)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
-            # 4. Matte at latent resolution for loss weighting
-            matte_latent = resize_matte_to_latent(matte)  # (B, 1, 64, 64)
+            # 4. Spatial loss weight at latent resolution
+            matte_latent = resize_matte_to_latent(loss_mask)  # (B, 1, 64, 64)
 
             # Cast inputs to bfloat16 for model forward passes
             noisy_latents = noisy_latents.to(dtype=torch.bfloat16)
             sigmas_1d = sigmas.view(B).to(dtype=torch.bfloat16)  # (B,) transformer expects bf16
 
             # 5. ControlNet forward → block_samples + null conditioning
+            #    HairControlNet VAE-encodes cond_image as its conditioning signal.
+            #    In inverse mode cond_image = hair photo; in forward mode = sketch.
             block_samples, null_enc_hs, null_pooled = self.controlnet(
                 noisy_latent=noisy_latents,
-                sketch=sketch,
+                sketch=cond_image,
                 matte=matte,
                 sigmas=sigmas_1d,
             )
-            # Accelerator's convert_to_fp32 converts controlnet outputs to fp32.
-            # Cast back to bf16 so the frozen bf16 transformer can consume them.
             block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
             null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
             null_pooled   = null_pooled.to(dtype=torch.bfloat16)
@@ -417,7 +456,7 @@ class Trainer:
             # 7. Flow matching velocity target: v = noise - latents
             v_target = (noise - latents).to(dtype=torch.bfloat16)
 
-            # 8. Loss
+            # 8. Direct supervision loss
             total_loss, log_dict = self.loss_fn(
                 v_pred=v_pred,
                 v_target=v_target,
@@ -426,11 +465,62 @@ class Trainer:
                 sigmas=sigmas.to(dtype=torch.bfloat16),
                 vae=self.vae,
                 target_rgb=target,
-                sketch=sketch,
-                matte=matte,
+                sketch=cond_image,   # edge loss uses this; disabled in inverse via w_edge=0.0
+                matte=loss_mask,
                 current_step=self.global_step,
                 total_steps=self.total_steps,
             )
+
+            controlnet_unwrapped = self.accelerator.unwrap_model(self.controlnet)
+
+            # 9. Cycle loss: decoder head (O(1)) preferred over full-diffusion fallback
+            if self._current_epoch >= self.cycle_start and self.w_cycle > 0.0:
+                if (self.inverse_mode
+                        and controlnet_unwrapped.sketch_decoder is not None):
+                    # Decoder head cycle: block_samples → sketch_pred (no diffusion)
+                    sketch_pred_cycle = controlnet_unwrapped.sketch_decoder(block_samples)
+                    sketch_gt_cycle   = batch["sketch"].to(device=device, dtype=torch.float32)
+                    stroke_cycle = (sketch_gt_cycle.mean(dim=1, keepdim=True) > 0.05).float()
+                    cycle_loss = (
+                        F.l1_loss(sketch_pred_cycle.float(), sketch_gt_cycle, reduction="none")
+                        * stroke_cycle
+                    ).sum() / stroke_cycle.sum().clamp(min=1)
+                    total_loss = total_loss + self.w_cycle * cycle_loss
+                    log_dict["loss_cycle"] = cycle_loss.item()
+
+                elif self.forward_controlnet is not None:
+                    # Full-diffusion cycle: x_0 pred → VAE decode → forward ControlNet features
+                    x0_pred = noisy_latents.float() - sigmas.float() * v_pred.float()
+                    sketch_pred_rgb = self.vae.decode(x0_pred.to(dtype=torch.bfloat16)).clamp(0, 1)
+                    block_pred = self.forward_controlnet._get_features_impl(
+                        sketch_pred_rgb, matte.to(device=device, dtype=torch.bfloat16)
+                    )
+                    with torch.no_grad():
+                        block_gt = self.forward_controlnet._get_features_impl(
+                            batch["sketch"].to(device=device, dtype=torch.bfloat16),
+                            matte.to(device=device, dtype=torch.bfloat16),
+                        )
+                    cycle_loss = sum(
+                        F.mse_loss(bp, bg.detach())
+                        for bp, bg in zip(block_pred, block_gt)
+                    ) / len(block_pred)
+                    total_loss = total_loss + self.w_cycle * cycle_loss
+                    log_dict["loss_cycle"] = cycle_loss.item()
+
+            # 10. Sketch decoder reconstruction loss (forward mode only)
+            #     Forces ControlNet block features to encode sketch structure.
+            if (not self.inverse_mode
+                    and self.w_sketch_dec > 0.0
+                    and controlnet_unwrapped.sketch_decoder is not None):
+                sketch_pred_dec = controlnet_unwrapped.sketch_decoder(block_samples)
+                sketch_gt_dec   = cond_image.to(dtype=torch.float32)
+                stroke_dec = (sketch_gt_dec.mean(dim=1, keepdim=True) > 0.05).float()
+                l_sketch_recon = (
+                    F.l1_loss(sketch_pred_dec.float(), sketch_gt_dec, reduction="none")
+                    * stroke_dec
+                ).sum() / stroke_dec.sum().clamp(min=1)
+                total_loss = total_loss + self.w_sketch_dec * l_sketch_recon
+                log_dict["loss_sketch_recon"] = l_sketch_recon.item()
 
             self.accelerator.backward(total_loss)
 
