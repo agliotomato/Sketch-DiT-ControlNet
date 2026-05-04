@@ -97,6 +97,19 @@ class VAEWrapper(nn.Module):
         images = self.vae.decode(raw).sample
         return images
 
+    def encode_for_grad(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode with gradient tracking for LPIPS cycle backprop.
+
+        Unlike encode(), this is NOT wrapped in torch.no_grad().
+        Uses posterior.mean (not sample) for deterministic, stable gradients.
+        VAE parameters have requires_grad=False so they are not updated,
+        but gradients flow through to the input (sketch_pred → inverse model params).
+        """
+        images_11 = self.normalize(images).to(dtype=next(self.vae.parameters()).dtype)
+        posterior = self.vae.encode(images_11).latent_dist
+        raw_latent = posterior.mean  # deterministic: no stochastic noise in grad chain
+        return (raw_latent - self.shift_factor) * self.scaling_factor
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """Encode only (convenience for training)."""
         return self.encode(images)

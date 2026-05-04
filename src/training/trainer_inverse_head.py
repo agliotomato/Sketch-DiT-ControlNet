@@ -1,19 +1,24 @@
 """
-InverseHeadTrainer: Hair→Sketch via frozen DiT internal features + trainable FPN mask decoder.
+InverseHeadTrainer: Hair→Sketch via partially-unfrozen DiT + trainable FPN mask decoder.
 
-Trainable:
-  - HairToSketchDiT.feature_extractor.lora_modules  (LoRA on 3 DiT blocks)
-  - HairToSketchDiT.stroke_decoder  (FPNMaskDecoder)
-  - HairToSketchDiT.matte_decoder   (FPNMaskDecoder)
+Backbone:
+  blocks 0-11:  frozen base + LoRA (to_q/k/v, rank-8)
+  blocks 12-23: fully unfrozen (all parameters trainable, lower LR via backbone_lr_scale)
 
-Frozen:
-  - SD3.5 DiT (base weights)
-  - VAE encoder/decoder
+Loss schedule:
+  Phase 1 (epoch < cycle_start):
+    Every step → supervised (structure BCE + color L1 + matte BCE+Dice+L1 + TV)
 
-Loss: InversionLoss (structure BCE + color L1 + matte BCE+Dice) + TV Loss on stroke_mask.
-Two-phase training (교수님 지시):
-  Phase 1 (0 ~ cycle_start): supervised mask/matte/color only
-  Phase 2 (cycle_start ~):   + cycle loss w=0.01 via frozen forward ControlNet
+  Phase 2 (epoch >= cycle_start):
+    Even global_step → supervised step (same as phase 1)
+    Odd  global_step → cycle step:
+        - feature MSE: MSE(forward_cn.features(sketch_pred), forward_cn.features(sketch_gt))
+        - image LPIPS: LPIPS(vae.decode(dit(encode_for_grad(sketch_pred))), hair_orig)
+
+Mini-batch alternating design:
+  Two separate zero_grad/backward/step pairs per alternation period.
+  The feature cycle and LPIPS cycle both use enable_grad=True paths so that
+  gradients reach the inverse model parameters through frozen forward models.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers import SD3Transformer2DModel
 from torch.optim import AdamW
@@ -34,7 +40,6 @@ from src.models.controlnet_sd35 import HairControlNet
 from src.models.inverse_head import HairToSketchDiT
 from src.models.vae_wrapper import VAEWrapper
 from src.training.losses_inversion import InversionLoss, tv_loss
-import torch.nn.functional as F
 
 
 class InverseHeadTrainer:
@@ -59,7 +64,8 @@ class InverseHeadTrainer:
         for p in self.vae.parameters():
             p.requires_grad_(False)
 
-        # --- Frozen DiT (base weights; LoRA will be injected inside HairToSketchDiT) ---
+        # --- DiT backbone: freeze ALL first; DiTFeatureExtractor will selectively
+        #     re-enable blocks 12-23 and inject LoRA on blocks 0-11. ---
         self.transformer = SD3Transformer2DModel.from_pretrained(
             model_id, subfolder="transformer",
             torch_dtype=torch.bfloat16, local_files_only=local_only,
@@ -68,11 +74,12 @@ class InverseHeadTrainer:
             p.requires_grad_(False)
         self.transformer.eval()
 
-        # --- Frozen forward ControlNet (for Phase 2 cycle loss) ---
+        # --- Frozen forward ControlNet (phase 2 feature cycle + LPIPS cycle) ---
         self.forward_controlnet: HairControlNet | None = None
-        self.w_cycle    = tcfg["loss_weights"].get("cycle", 0.0)
+        self.w_cycle     = tcfg["loss_weights"].get("cycle", 0.01)
+        self.w_lpips     = tcfg["loss_weights"].get("lpips_cycle", 0.05)
         self.cycle_start = tcfg.get("cycle_start", 9999)
-        if self.w_cycle > 0 and Path(controlnet_ckpt).exists():
+        if (self.w_cycle > 0 or self.w_lpips > 0) and Path(controlnet_ckpt).exists():
             fwd_cn = HairControlNet(
                 model_id=model_id, vae=self.vae,
                 num_layers=config["model"].get("num_controlnet_layers", 12),
@@ -85,16 +92,18 @@ class InverseHeadTrainer:
                 p.requires_grad_(False)
             self.forward_controlnet = fwd_cn
 
-        # --- Trainable model: LoRA + FPN decoders ---
-        # Reuse null embeddings from forward ControlNet (already trained)
-        # If no forward ControlNet loaded, create placeholder (will be learned)
+        # --- Null embeddings (reuse from forward ControlNet if available) ---
         if self.forward_controlnet is not None:
             null_enc_hs = self.forward_controlnet.null_encoder_hidden_states.detach()
             null_pooled = self.forward_controlnet.null_pooled_projections.detach()
         else:
             null_enc_hs = torch.zeros(1, 333, 4096, dtype=torch.bfloat16)
             null_pooled = torch.zeros(1, 2048, dtype=torch.bfloat16)
+        # Keep references for LPIPS cycle (transformer forward pass with null cond)
+        self._null_enc_hs = null_enc_hs
+        self._null_pooled = null_pooled
 
+        # --- Trainable model: LoRA (blocks 0-11) + back_blocks (12-23) + FPN decoders ---
         lora_cfg = config.get("lora", {})
         self.model = HairToSketchDiT(
             transformer=self.transformer,
@@ -105,6 +114,17 @@ class InverseHeadTrainer:
             lora_alpha=lora_cfg.get("alpha", 8.0),
             grid_size=config.get("grid_size", 16),
         )
+
+        # --- LPIPS metric (frozen VGG network) ---
+        try:
+            import lpips
+            self.lpips_fn = lpips.LPIPS(net="vgg").eval()
+            for p in self.lpips_fn.parameters():
+                p.requires_grad_(False)
+        except ImportError:
+            self.lpips_fn = None
+            self.w_lpips  = 0.0
+            self.accelerator.print("WARNING: lpips not installed; image LPIPS cycle disabled.")
 
         # --- Data ---
         aug = build_augmentation_pipeline("pretrain")
@@ -127,13 +147,31 @@ class InverseHeadTrainer:
             num_workers=4, pin_memory=True,
         )
 
-        # --- Optimizer: only trainable params (LoRA + decoders) ---
+        # --- Optimizer: separate param groups for back_blocks (lower LR) ---
+        backbone_lr_scale = config.get("backbone_lr_scale", 0.1)
+        base_lr           = tcfg.get("learning_rate", 1e-4)
+        back_block_param_ids = {
+            id(p) for p in self.model.feature_extractor.back_blocks.parameters()
+            if p.requires_grad
+        }
+        back_params = [
+            p for p in self.model.feature_extractor.back_blocks.parameters()
+            if p.requires_grad
+        ]
+        main_params = [
+            p for p in self.model.parameters()
+            if p.requires_grad and id(p) not in back_block_param_ids
+        ]
         self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=tcfg.get("learning_rate", 1e-4),
+            [
+                {"params": main_params, "lr": base_lr,                       "_base_lr": base_lr},
+                {"params": back_params, "lr": base_lr * backbone_lr_scale,   "_base_lr": base_lr * backbone_lr_scale},
+            ],
+            lr=base_lr,
             betas=(0.9, 0.999),
             weight_decay=1e-2,
         )
+
         total_steps  = tcfg.get("epochs", 50) * len(self.train_loader)
         warmup_steps = tcfg.get("warmup_steps", 200)
         self.warmup_steps = warmup_steps
@@ -143,12 +181,12 @@ class InverseHeadTrainer:
 
         # --- Loss ---
         lw = tcfg.get("loss_weights", {})
-        self.loss_fn  = InversionLoss(
+        self.loss_fn = InversionLoss(
             w_structure=lw.get("structure", 1.0),
             w_color=lw.get("color", 0.5),
             w_matte=lw.get("matte", 1.0),
         )
-        self.w_tv     = lw.get("tv", 0.01)
+        self.w_tv = lw.get("tv", 0.01)
 
         self.output_dir = Path(config["checkpointing"]["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -170,15 +208,19 @@ class InverseHeadTrainer:
         self.transformer = self.transformer.to(device)
         if self.forward_controlnet is not None:
             self.forward_controlnet = self.forward_controlnet.to(device)
+        if self.lpips_fn is not None:
+            self.lpips_fn = self.lpips_fn.to(device)
+        self._null_enc_hs = self._null_enc_hs.to(device)
+        self._null_pooled = self._null_pooled.to(device)
 
         wcfg = config.get("wandb", {})
         self.accelerator.init_trackers(
             project_name=wcfg.get("project", "hair-dit"),
             config=_flatten(config),
             init_kwargs={"wandb": {
-                "name": "inverse_head_dit",
+                "name": "inverse_head_dit_partial_unfreeze",
                 "entity": wcfg.get("entity") or None,
-                "tags": ["inverse", "dit_features", "fpn", "lora"],
+                "tags": ["inverse", "dit_features", "fpn", "lora", "partial_unfreeze", "cycle_lpips"],
                 "config": config,
             }},
         )
@@ -217,20 +259,28 @@ class InverseHeadTrainer:
             self.model.train()
             epoch_losses = []
 
-            desc = f"Epoch {epoch+1}/{epochs}" + (" [+cycle]" if phase2 else "")
+            desc = f"Epoch {epoch+1}/{epochs}" + (" [+cycle-alt]" if phase2 else "")
             progress = tqdm(
                 self.train_loader, desc=desc,
                 disable=not self.accelerator.is_local_main_process,
             )
 
             for batch in progress:
-                loss, log_dict = self._train_step(batch, phase2=phase2)
+                # Phase 1: supervised only.
+                # Phase 2: alternate — even steps supervised, odd steps cycle.
+                if phase2 and self.global_step % 2 == 1:
+                    loss, log_dict = self._cycle_step(batch)
+                else:
+                    loss, log_dict = self._supervised_step(batch)
+
                 epoch_losses.append(log_dict["loss_total"])
 
                 if self.global_step < self.warmup_steps:
                     lr_scale = min(1.0, (self.global_step + 1) / max(self.warmup_steps, 1))
                     for pg in self.optimizer.param_groups:
-                        pg["lr"] = tcfg["learning_rate"] * lr_scale
+                        # Each group has its own _base_lr (main vs back_blocks at lower LR).
+                        # CosineAnnealingLR will continue from these once warmup ends.
+                        pg["lr"] = pg["_base_lr"] * lr_scale
                 else:
                     self.lr_scheduler.step()
 
@@ -256,7 +306,8 @@ class InverseHeadTrainer:
         self._save("final.pth", epochs - 1)
         self.accelerator.end_training()
 
-    def _train_step(self, batch: dict, phase2: bool = False) -> tuple[torch.Tensor, dict]:
+    def _supervised_step(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        """Supervised loss only: structure BCE + color L1 + matte losses + TV."""
         device = self.accelerator.device
         dtype  = torch.bfloat16
 
@@ -268,7 +319,6 @@ class InverseHeadTrainer:
 
         sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
 
-        # Phase 1: supervised loss only
         loss, log_dict = self.loss_fn(
             stroke_mask_pred=stroke_mask,
             sketch_pred=sketch_pred,
@@ -277,26 +327,11 @@ class InverseHeadTrainer:
             matte_gt=matte_gt,
         )
 
-        # TV loss: smooth stroke mask (no abrupt breaks)
         l_tv = tv_loss(stroke_mask.float())
         loss = loss + self.w_tv * l_tv
-        log_dict["loss_tv"] = l_tv.item()
-
-        # Phase 2: cycle loss via frozen forward ControlNet (w=0.01)
-        if phase2 and self.forward_controlnet is not None:
-            block_pred = self.forward_controlnet._get_features_impl(
-                sketch_pred.float(), matte_gt.float()
-            )
-            with torch.no_grad():
-                block_gt = self.forward_controlnet._get_features_impl(
-                    sketch_gt.float(), matte_gt.float()
-                )
-            cycle = sum(
-                F.mse_loss(bp, bg.detach())
-                for bp, bg in zip(block_pred, block_gt)
-            ) / len(block_pred)
-            loss = loss + self.w_cycle * cycle
-            log_dict["loss_cycle"] = cycle.item()
+        log_dict["loss_tv"]    = l_tv.item()
+        log_dict["loss_total"] = loss.item()   # refresh after TV term
+        log_dict["step_type"]  = 0.0           # supervised=0 for logging
 
         self.accelerator.backward(loss)
         if self.cfg["training"].get("gradient_clip"):
@@ -306,6 +341,128 @@ class InverseHeadTrainer:
             )
         self.optimizer.step()
         return loss, log_dict
+
+    def _cycle_step(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        """Cycle loss step (phase 2): feature MSE + image-space LPIPS cycle.
+
+        Both losses use enable_grad=True paths so that the gradient propagates
+        back through frozen forward models to the inverse model parameters.
+        """
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+
+        hair_image = batch["img"].to(device, dtype=dtype)
+        sketch_gt  = batch["sketch"].to(device, dtype=dtype)
+        matte_gt   = batch["matte"].to(device, dtype=dtype)
+
+        # If both cycle losses disabled, fall back to supervised step
+        # (this can happen if forward_controlnet failed to load and lpips is missing).
+        feat_active  = self.forward_controlnet is not None and self.w_cycle > 0
+        lpips_active = self.w_lpips > 0 and self.lpips_fn is not None
+        if not feat_active and not lpips_active:
+            return self._supervised_step(batch)
+
+        self.optimizer.zero_grad()
+
+        # Fresh inverse model forward (with full gradient tracking)
+        sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
+
+        loss_terms: list[torch.Tensor] = []
+        log_dict: dict = {}
+
+        # --- Feature cycle: MSE between ControlNet features of pred vs GT ---
+        if feat_active:
+            # enable_grad=True: gradient flows through frozen ControlNet → sketch_pred → inverse model
+            block_pred = self.forward_controlnet._get_features_impl(
+                sketch_pred.float(), matte_gt.float(), enable_grad=True,
+            )
+            with torch.no_grad():
+                block_gt = self.forward_controlnet._get_features_impl(
+                    sketch_gt.float(), matte_gt.float(),
+                )
+            feat_cycle = sum(
+                F.mse_loss(bp, bg.detach())
+                for bp, bg in zip(block_pred, block_gt)
+            ) / len(block_pred)
+            loss_terms.append(self.w_cycle * feat_cycle)
+            log_dict["loss_cycle_feat"] = feat_cycle.item()
+
+        # --- Image-space LPIPS cycle: LPIPS(vae.decode(dit(encode(sketch_pred))), hair_orig) ---
+        if lpips_active:
+            lpips_loss = self._compute_image_lpips_cycle(sketch_pred.float(), hair_image.float())
+            loss_terms.append(self.w_lpips * lpips_loss)
+            log_dict["loss_cycle_lpips"] = lpips_loss.item()
+
+        # Sum loss terms — guaranteed non-empty by the early-return above
+        total_cycle = sum(loss_terms[1:], loss_terms[0])
+
+        log_dict["loss_total"] = total_cycle.item()
+        log_dict["step_type"]  = 1.0  # cycle=1 for logging
+
+        self.accelerator.backward(total_cycle)
+        if self.cfg["training"].get("gradient_clip"):
+            self.accelerator.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad],
+                self.cfg["training"]["gradient_clip"],
+            )
+        self.optimizer.step()
+        return total_cycle, log_dict
+
+    def _compute_image_lpips_cycle(
+        self,
+        sketch_pred: torch.Tensor,   # (B, 3, 512, 512) float32, gradient-tracked
+        hair_image:  torch.Tensor,   # (B, 3, 512, 512) float32 in [0, 1], no grad needed
+    ) -> torch.Tensor:
+        """
+        sketch_pred → vae.encode_for_grad → sketch_latent
+                    → transformer(sigma=0, null_cond) → pred_hair_latent
+                    → vae.decode → hair_recon (in [-1, 1])
+        LPIPS(hair_recon, normalize(hair_image))
+
+        The VAE and transformer are frozen (requires_grad=False for their params),
+        but gradients DO flow through them back to sketch_pred because:
+          - vae.encode_for_grad has no torch.no_grad() wrapper
+          - vae.decode has no torch.no_grad() wrapper
+          - transformer back_blocks (12-23) are unfrozen and also receive grads here
+
+        NOTE (multi-GPU): self.transformer is NOT wrapped by accelerator.prepare(),
+        so back_blocks gradients accumulated through this call bypass DDP sync.
+        Tested with single-GPU; for multi-GPU use, route through self.model or
+        wrap self.transformer separately.
+        """
+        B      = sketch_pred.shape[0]
+        device = sketch_pred.device
+        dtype  = sketch_pred.dtype
+
+        # sketch_pred [0,1] → sketch_latent (with grad)
+        sketch_latent = self.vae.encode_for_grad(sketch_pred)   # (B, 16, 64, 64)
+        sketch_latent = sketch_latent.to(dtype=torch.bfloat16)
+
+        # Run DiT (sigma=0) on sketch_latent to predict hair-like latent.
+        # No ControlNet injection here for simplicity — bare DiT single-step prediction.
+        # Back_blocks (12-23) are unfrozen and also get LPIPS gradients.
+        null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
+        null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=torch.bfloat16)
+        sigma    = torch.zeros(B, device=device, dtype=torch.bfloat16)
+
+        pred_hair_latent = self.transformer(
+            hidden_states=sketch_latent,
+            encoder_hidden_states=null_enc,
+            pooled_projections=null_p,
+            timestep=sigma,
+            return_dict=False,
+        )[0]   # (B, 16, 64, 64)
+
+        # Decode to pixel space (VAE params frozen, but grad flows to input)
+        hair_recon = self.vae.decode(pred_hair_latent).to(dtype=dtype)  # (B, 3, 512, 512) in [-1,1]
+
+        # hair_image is [0,1]; normalize to [-1,1] for LPIPS comparison
+        hair_ref = VAEWrapper.normalize(hair_image)   # (B, 3, 512, 512) in [-1,1]
+
+        return self.lpips_fn(
+            hair_recon.clamp(-1.0, 1.0),
+            hair_ref.clamp(-1.0, 1.0),
+        ).mean()
 
     @torch.no_grad()
     def _validate(self) -> float:

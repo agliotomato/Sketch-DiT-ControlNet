@@ -4,7 +4,9 @@ HairToSketchDiT: Hair Image → (Sketch, Matte) via DiT internal features.
 Architecture:
   hair_image (B, 3, 512, 512)
     → frozen VAE encoder → hair_latent (B, 16, 64, 64)
-    → DiTFeatureExtractor (frozen DiT + trainable LoRA) → {early, mid, late} (B, 1536, 32, 32)
+    → DiTFeatureExtractor → {early, mid, late} (B, 1536, 32, 32)
+        blocks 0-11:  frozen base + LoRA (to_q/k/v rank-8)
+        blocks 12-23: fully unfrozen (lower LR in optimizer param group)
     → FPNMaskDecoder (trainable) → stroke_mask (B, 1, 512, 512)
     → FPNMaskDecoder (trainable) → matte_pred  (B, 1, 512, 512)
     → patch_color_sample(hair * matte_pred, stroke_mask) → sketch_pred

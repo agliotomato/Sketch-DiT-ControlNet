@@ -241,18 +241,27 @@ class HairControlNet(nn.Module):
         self,
         condition_image: torch.Tensor,
         matte: torch.Tensor,
+        enable_grad: bool = False,
     ) -> list[torch.Tensor]:
         """
         조건 이미지 → ControlNet block_samples 추출 (공유 구현).
 
         condition_image: (B, 3, 512, 512) — sketch (inversion용) 또는 hair image (cycle loss용)
         matte:           (B, 1, 512, 512)
+        enable_grad:     True → VAE encode without no_grad so gradients flow back to
+                         condition_image (needed for cycle loss to reach inverse model params).
+                         False (default) → standard no_grad encode for efficiency.
         """
         B = condition_image.shape[0]
         device = condition_image.device
         dtype = condition_image.dtype
 
-        cond_latent  = self._vae.encode(condition_image.to(dtype=dtype)).to(device=device, dtype=dtype)
+        if enable_grad:
+            # Gradient-enabled encode: allows ∂cycle_loss/∂condition_image → inverse model params
+            cond_latent = self._vae.encode_for_grad(condition_image.to(dtype=dtype)).to(device=device, dtype=dtype)
+        else:
+            cond_latent = self._vae.encode(condition_image.to(dtype=dtype)).to(device=device, dtype=dtype)
+
         matte_feat   = self.matte_cnn(matte.to(device=device, dtype=dtype))
         matte_latent = F.interpolate(
             matte.to(device=device, dtype=dtype), size=(64, 64), mode="bilinear", align_corners=False

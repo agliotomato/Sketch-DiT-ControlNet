@@ -3,20 +3,21 @@ DiT Internal Feature Extractor for Hair→Sketch Inverse Task.
 
 Architecture:
   hair_latent (B, 16, 64, 64)
-    → frozen SD3.5 DiT (sigma=0, null conditioning)
+    → SD3.5 DiT (sigma=0, null conditioning)
+        blocks 0-11:  frozen base + LoRA (to_q/to_k/to_v, rank-8)
+        blocks 12-23: fully unfrozen (all parameters trainable)
     → hooks at ALL 24 blocks
     → learnable 3×24 aggregation weights (softmax over blocks)
     → three aggregated feature maps: early / mid / late
     → each (B, inner_dim, 32, 32)
 
-LoRA: injected into to_q/to_k/to_v of ALL 24 blocks.
-      All blocks see the same OOD input (sigma=0 clean latent),
-      so all need adaptation — not just 3 fixed positions.
+Partial unfreeze rationale:
+  Front 12 (lower-level texture): LoRA-only — preserve general features.
+  Back 12  (higher-level semantic): fully unfrozen — learn hair-specific semantics.
 
 Aggregation: three independent softmax weight vectors over 24 blocks.
   - Eliminates arbitrary hook position selection
-  - Weights are interpretable after convergence (which blocks matter for hair→sketch)
-  - Follows Diffusion Hyperfeatures (NeurIPS 2023) approach
+  - Weights interpretable after convergence
 
 JointTransformerBlock.forward() returns (encoder_hidden_states, hidden_states).
 Image features = second element. Block 23 (context_pre_only) returns (None, hs).
@@ -57,9 +58,10 @@ class DiTFeatureExtractor(nn.Module):
     After convergence, agg_weights reveals which blocks are important for hair→sketch.
     """
 
-    NUM_BLOCKS:   int = 24
-    IMAGE_TOKENS: int = 1024   # 32×32 for 512px → 64×64 latent → patch_size=2
-    SPATIAL_SIZE: int = 32
+    NUM_BLOCKS:     int = 24
+    NUM_FRONT_LORA: int = 12   # blocks 0-11: LoRA only; blocks 12-23: fully unfrozen
+    IMAGE_TOKENS:   int = 1024   # 32×32 for 512px → 64×64 latent → patch_size=2
+    SPATIAL_SIZE:   int = 32
     SCALE_NAMES         = ("early", "mid", "late")
 
     def __init__(
@@ -81,13 +83,23 @@ class DiTFeatureExtractor(nn.Module):
         # Initialized to zeros → uniform softmax at start
         self.agg_weights = nn.Parameter(torch.zeros(len(self.SCALE_NAMES), self.NUM_BLOCKS))
 
+        # LoRA on front 12 blocks (0-11); back 12 blocks are fully unfrozen below
         self.lora_modules = nn.ModuleList()
         if lora_rank > 0:
             self._inject_lora(lora_rank, lora_alpha)
 
+        # Register back blocks (12-23) as submodule so their parameters appear in
+        # model.parameters() and receive gradients from both supervised and LPIPS paths.
+        # Trainer freezes ALL transformer params first; this selectively re-enables them.
+        self.back_blocks = nn.ModuleList(
+            transformer.transformer_blocks[self.NUM_FRONT_LORA:]
+        )
+        for p in self.back_blocks.parameters():
+            p.requires_grad_(True)
+
     def _inject_lora(self, rank: int, alpha: float) -> None:
-        """Replace to_q/to_k/to_v in ALL blocks with LoRALinear wrappers."""
-        for idx in range(self.NUM_BLOCKS):
+        """Replace to_q/to_k/to_v in front NUM_FRONT_LORA blocks with LoRALinear wrappers."""
+        for idx in range(self.NUM_FRONT_LORA):
             attn = self._transformer.transformer_blocks[idx].attn
             for attr in ("to_q", "to_k", "to_v"):
                 linear = getattr(attn, attr, None)
