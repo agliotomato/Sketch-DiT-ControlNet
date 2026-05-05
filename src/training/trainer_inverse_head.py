@@ -31,6 +31,7 @@ from accelerate import Accelerator
 from diffusers import SD3Transformer2DModel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
@@ -290,10 +291,18 @@ class InverseHeadTrainer:
                 val_loss = self._validate()
                 self.accelerator.print(f"Val loss: {val_loss:.4f}")
                 self.accelerator.log({"val_loss": val_loss, "epoch": epoch + 1}, step=self.global_step)
-                self._log_images(epoch)
+
+                # Save BEFORE image logging — logging crashes must not lose checkpoint
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self._save("best.pth", epoch)
+                self._save("last.pth", epoch)   # always-overwrite latest
+
+                # Wrap media logging so failures don't kill training
+                try:
+                    self._log_images(epoch)
+                except Exception as e:
+                    self.accelerator.print(f"[warn] _log_images failed (skipping): {e}")
 
             if (epoch + 1) % save_every == 0:
                 self._save(f"epoch_{epoch+1}.pth", epoch)
@@ -440,13 +449,22 @@ class InverseHeadTrainer:
         null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=torch.bfloat16)
         sigma    = torch.zeros(B, device=device, dtype=torch.bfloat16)
 
-        pred_hair_latent = self.transformer(
-            hidden_states=sketch_latent,
-            encoder_hidden_states=null_enc,
-            pooled_projections=null_p,
-            timestep=sigma,
-            return_dict=False,
-        )[0]   # (B, 16, 64, 64)
+        # Gradient checkpointing on this transformer pass (single biggest activation
+        # source in cycle step). Forward saves no activations; backward recomputes.
+        # Trades ~30% extra compute for ~10GB memory — keeps batch_size=4 viable.
+        # use_reentrant=False: PyTorch >=2.0 API, hook-safe (no double firing).
+        def _tx_fwd(latent, enc, pool, t):
+            return self.transformer(
+                hidden_states=latent,
+                encoder_hidden_states=enc,
+                pooled_projections=pool,
+                timestep=t,
+                return_dict=False,
+            )[0]
+        pred_hair_latent = checkpoint(
+            _tx_fwd, sketch_latent, null_enc, null_p, sigma,
+            use_reentrant=False,
+        )   # (B, 16, 64, 64)
 
         # Decode to pixel space (VAE params frozen, but grad flows to input)
         hair_recon = self.vae.decode(pred_hair_latent).to(dtype=dtype)  # (B, 3, 512, 512) in [-1,1]
