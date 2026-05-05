@@ -47,9 +47,10 @@ class InverseHeadTrainer:
         self.cfg  = config
         tcfg      = config["training"]
 
+        # tensorboard only — wandb removed to avoid media-API instability
         self.accelerator = Accelerator(
             mixed_precision=config.get("mixed_precision", "bf16"),
-            log_with=["tensorboard", "wandb"],
+            log_with=["tensorboard"],
             project_dir=config["checkpointing"]["output_dir"],
         )
 
@@ -213,16 +214,10 @@ class InverseHeadTrainer:
         self._null_enc_hs = self._null_enc_hs.to(device)
         self._null_pooled = self._null_pooled.to(device)
 
-        wcfg = config.get("wandb", {})
+        run_name = config.get("run_name", "inverse_head_dit_partial_unfreeze")
         self.accelerator.init_trackers(
-            project_name=wcfg.get("project", "hair-dit"),
+            project_name=run_name,
             config=_flatten(config),
-            init_kwargs={"wandb": {
-                "name": "inverse_head_dit_partial_unfreeze",
-                "entity": wcfg.get("entity") or None,
-                "tags": ["inverse", "dit_features", "fpn", "lora", "partial_unfreeze", "cycle_lpips"],
-                "config": config,
-            }},
         )
 
         self.global_step   = 0
@@ -488,8 +483,18 @@ class InverseHeadTrainer:
         if not self.accelerator.is_main_process:
             return
         try:
-            import wandb, numpy as np
+            import numpy as np
         except ImportError:
+            return
+
+        # tensorboard writer (single backend — no wandb)
+        tb_writer = None
+        try:
+            tb = self.accelerator.get_tracker("tensorboard", unwrap=True)
+            tb_writer = tb if hasattr(tb, "add_image") else getattr(tb, "writer", None)
+        except Exception:
+            tb_writer = None
+        if tb_writer is None:
             return
 
         device = self.accelerator.device
@@ -524,10 +529,12 @@ class InverseHeadTrainer:
         def to_np(t):
             return (t.float().cpu().numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
 
-        panels = []
         cap = "hair | sketch_pred | sketch_GT | matte_pred | matte_GT"
         if log_recon:
             cap += " | hair_recon (cycle)"
+
+        # Build panels as raw numpy arrays (HWC uint8)
+        panel_arrays = []
         for i in range(min(n_samples, hair_image.shape[0])):
             cols = [
                 to_np(hair_image)[i],
@@ -538,24 +545,25 @@ class InverseHeadTrainer:
             ]
             if log_recon:
                 cols.append(to_np(hair_recon)[i])
-            panel = np.concatenate(cols, axis=1)
-            panels.append(wandb.Image(panel, caption=f"{cap}  ({i})"))
-        wandb.log({"val_images": panels}, step=self.global_step)
+            panel_arrays.append(np.concatenate(cols, axis=1))
 
-        # Block importance bar chart: which DiT blocks dominate each scale?
-        # Useful for verifying that back_blocks (12-23) become more dominant after unfreeze.
+        # tensorboard image logging (only backend)
+        for i, p in enumerate(panel_arrays):
+            tb_writer.add_image(
+                f"val/sample_{i}", p.transpose(2, 0, 1),
+                self.global_step, dataformats="CHW",
+            )
+
+        # --- Block importance: log as scalar dict (works in both backends) ---
+        # Each block's weight per scale → flat metric so it shows in any tracker.
         unwrapped = self.accelerator.unwrap_model(self.model)
         block_imp = unwrapped.feature_extractor.get_block_importance()
-        for scale, w in block_imp.items():
-            data = [[i, float(w[i])] for i in range(w.shape[0])]
-            table = wandb.Table(data=data, columns=["block", "weight"])
-            wandb.log(
-                {f"block_importance/{scale}": wandb.plot.bar(
-                    table, "block", "weight",
-                    title=f"DiT Block Importance — {scale}",
-                )},
-                step=self.global_step,
-            )
+        flat = {
+            f"block_importance/{scale}/blk{i:02d}": float(w[i])
+            for scale, w in block_imp.items()
+            for i in range(w.shape[0])
+        }
+        self.accelerator.log(flat, step=self.global_step)
 
     def _save(self, filename: str, epoch: int):
         if not self.accelerator.is_main_process:
