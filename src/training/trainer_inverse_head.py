@@ -349,68 +349,89 @@ class InverseHeadTrainer:
     def _cycle_step(self, batch: dict) -> tuple[torch.Tensor, dict]:
         """Cycle loss step (phase 2): feature MSE + image-space LPIPS cycle.
 
-        Both losses use enable_grad=True paths so that the gradient propagates
+        Memory: cycle adds forward_CN forward + DiT 2nd pass + VAE decode + VGG.
+        At full batch this OOMs on 40GB GPUs. We split the batch into N micro-batches
+        and gradient-accumulate — keeps supervised step at full batch (proven to fit).
+
+        Both losses use enable_grad=True paths so gradients propagate
         back through frozen forward models to the inverse model parameters.
         """
-        device = self.accelerator.device
-        dtype  = torch.bfloat16
-
-        hair_image = batch["img"].to(device, dtype=dtype)
-        sketch_gt  = batch["sketch"].to(device, dtype=dtype)
-        matte_gt   = batch["matte"].to(device, dtype=dtype)
-
         # If both cycle losses disabled, fall back to supervised step
-        # (this can happen if forward_controlnet failed to load and lpips is missing).
         feat_active  = self.forward_controlnet is not None and self.w_cycle > 0
         lpips_active = self.w_lpips > 0 and self.lpips_fn is not None
         if not feat_active and not lpips_active:
             return self._supervised_step(batch)
 
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+
+        full_hair   = batch["img"].to(device, dtype=dtype)
+        full_sketch = batch["sketch"].to(device, dtype=dtype)
+        full_matte  = batch["matte"].to(device, dtype=dtype)
+
+        bs        = full_hair.shape[0]
+        n_micro   = self.cfg.get("cycle_micro_batches", 2) if bs > 1 else 1
+        n_micro   = max(1, min(n_micro, bs))
+        chunk_sz  = (bs + n_micro - 1) // n_micro
+
         self.optimizer.zero_grad()
+        agg_log: dict = {"loss_cycle_feat": 0.0, "loss_cycle_lpips": 0.0, "loss_total": 0.0}
+        agg_total: float = 0.0
 
-        # Fresh inverse model forward (with full gradient tracking)
-        sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
+        for i in range(n_micro):
+            s = slice(i * chunk_sz, min((i + 1) * chunk_sz, bs))
+            hair_image = full_hair[s]
+            sketch_gt  = full_sketch[s]
+            matte_gt   = full_matte[s]
 
-        loss_terms: list[torch.Tensor] = []
-        log_dict: dict = {}
+            sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
 
-        # --- Feature cycle: MSE between ControlNet features of pred vs GT ---
-        if feat_active:
-            # enable_grad=True: gradient flows through frozen ControlNet → sketch_pred → inverse model
-            block_pred = self.forward_controlnet._get_features_impl(
-                sketch_pred.float(), matte_gt.float(), enable_grad=True,
-            )
-            with torch.no_grad():
-                block_gt = self.forward_controlnet._get_features_impl(
-                    sketch_gt.float(), matte_gt.float(),
+            loss_terms: list[torch.Tensor] = []
+
+            if feat_active:
+                block_pred = self.forward_controlnet._get_features_impl(
+                    sketch_pred.float(), matte_gt.float(), enable_grad=True,
                 )
-            feat_cycle = sum(
-                F.mse_loss(bp, bg.detach())
-                for bp, bg in zip(block_pred, block_gt)
-            ) / len(block_pred)
-            loss_terms.append(self.w_cycle * feat_cycle)
-            log_dict["loss_cycle_feat"] = feat_cycle.item()
+                with torch.no_grad():
+                    block_gt = self.forward_controlnet._get_features_impl(
+                        sketch_gt.float(), matte_gt.float(),
+                    )
+                feat_cycle = sum(
+                    F.mse_loss(bp, bg.detach())
+                    for bp, bg in zip(block_pred, block_gt)
+                ) / len(block_pred)
+                loss_terms.append(self.w_cycle * feat_cycle)
+                agg_log["loss_cycle_feat"] += feat_cycle.item() / n_micro
 
-        # --- Image-space LPIPS cycle: LPIPS(vae.decode(dit(encode(sketch_pred))), hair_orig) ---
-        if lpips_active:
-            lpips_loss = self._compute_image_lpips_cycle(sketch_pred.float(), hair_image.float())
-            loss_terms.append(self.w_lpips * lpips_loss)
-            log_dict["loss_cycle_lpips"] = lpips_loss.item()
+            if lpips_active:
+                lpips_loss = self._compute_image_lpips_cycle(
+                    sketch_pred.float(), hair_image.float()
+                )
+                loss_terms.append(self.w_lpips * lpips_loss)
+                agg_log["loss_cycle_lpips"] += lpips_loss.item() / n_micro
 
-        # Sum loss terms — guaranteed non-empty by the early-return above
-        total_cycle = sum(loss_terms[1:], loss_terms[0])
+            micro_total = sum(loss_terms[1:], loss_terms[0])
+            # Scale by 1/n_micro for proper averaging across micro-batches
+            self.accelerator.backward(micro_total / n_micro)
+            agg_total += micro_total.item() / n_micro
 
-        log_dict["loss_total"] = total_cycle.item()
-        log_dict["step_type"]  = 1.0  # cycle=1 for logging
+            # Free graph references between micro-batches
+            del sketch_pred, matte_pred, stroke_mask, micro_total, loss_terms
+            if feat_active:
+                del block_pred, block_gt, feat_cycle
+            if lpips_active:
+                del lpips_loss
 
-        self.accelerator.backward(total_cycle)
         if self.cfg["training"].get("gradient_clip"):
             self.accelerator.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad],
                 self.cfg["training"]["gradient_clip"],
             )
         self.optimizer.step()
-        return total_cycle, log_dict
+
+        agg_log["loss_total"] = agg_total
+        agg_log["step_type"]  = 1.0
+        return torch.tensor(agg_total, device=device), agg_log
 
     def _compute_image_lpips_cycle(
         self,
