@@ -500,10 +500,18 @@ class InverseHeadTrainer:
         # hair_image is [0,1]; normalize to [-1,1] for LPIPS comparison
         hair_ref = VAEWrapper.normalize(hair_image)   # (B, 3, 512, 512) in [-1,1]
 
-        return self.lpips_fn(
-            hair_recon.clamp(-1.0, 1.0),
-            hair_ref.clamp(-1.0, 1.0),
-        ).mean()
+        # LPIPS memory optimization:
+        #  1) downsample 512 → 256 — VGG was pretrained on 224, so 256 is more natural
+        #     and reduces first-layer activation by 4× (the dominant memory cost).
+        #  2) wrap in bf16 autocast — VGG fp32 weights but bf16 activations halve
+        #     memory again. LPIPS scalar value is robust to this precision.
+        recon_lp = F.interpolate(hair_recon.clamp(-1.0, 1.0),
+                                  size=(256, 256), mode="bilinear", align_corners=False)
+        ref_lp   = F.interpolate(hair_ref.clamp(-1.0, 1.0),
+                                  size=(256, 256), mode="bilinear", align_corners=False)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            lpips_val = self.lpips_fn(recon_lp, ref_lp).mean()
+        return lpips_val.float()
 
     @torch.no_grad()
     def _validate(self) -> float:
