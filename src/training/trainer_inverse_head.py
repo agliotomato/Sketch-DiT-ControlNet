@@ -474,6 +474,12 @@ class InverseHeadTrainer:
         # source in cycle step). Forward saves no activations; backward recomputes.
         # Trades ~30% extra compute for ~10GB memory — keeps batch_size=4 viable.
         # use_reentrant=False: PyTorch >=2.0 API, hook-safe (no double firing).
+        #
+        # autocast(bf16) must wrap this call: self.transformer is invoked DIRECTLY
+        # here (not via self.model which carries accelerator's autocast context).
+        # LoRA parameters are fp32 by default — matmul of bf16 input × fp32 LoRA
+        # would error without autocast. Supervised step works because self.model()
+        # goes through the prepared model with autocast already active.
         def _tx_fwd(latent, enc, pool, t):
             return self.transformer(
                 hidden_states=latent,
@@ -482,10 +488,11 @@ class InverseHeadTrainer:
                 timestep=t,
                 return_dict=False,
             )[0]
-        pred_hair_latent = checkpoint(
-            _tx_fwd, sketch_latent, null_enc, null_p, sigma,
-            use_reentrant=False,
-        )   # (B, 16, 64, 64)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred_hair_latent = checkpoint(
+                _tx_fwd, sketch_latent, null_enc, null_p, sigma,
+                use_reentrant=False,
+            )   # (B, 16, 64, 64)
 
         # Decode to pixel space (VAE params frozen, but grad flows to input)
         hair_recon = self.vae.decode(pred_hair_latent).to(dtype=dtype)  # (B, 3, 512, 512) in [-1,1]
