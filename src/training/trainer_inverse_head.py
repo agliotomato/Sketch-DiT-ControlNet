@@ -404,8 +404,9 @@ class InverseHeadTrainer:
                 agg_log["loss_cycle_feat"] += feat_cycle.item() / n_micro
 
             if lpips_active:
+                # Pass matte_pred (not matte_gt) — true round-trip cycle, semi-supervised compatible
                 lpips_loss = self._compute_image_lpips_cycle(
-                    sketch_pred.float(), hair_image.float()
+                    sketch_pred.float(), matte_pred.float(), hair_image.float()
                 )
                 loss_terms.append(self.w_lpips * lpips_loss)
                 agg_log["loss_cycle_lpips"] += lpips_loss.item() / n_micro
@@ -436,75 +437,114 @@ class InverseHeadTrainer:
     def _compute_image_lpips_cycle(
         self,
         sketch_pred: torch.Tensor,   # (B, 3, 512, 512) float32, gradient-tracked
-        hair_image:  torch.Tensor,   # (B, 3, 512, 512) float32 in [0, 1], no grad needed
+        matte_pred:  torch.Tensor,   # (B, 1, 512, 512) float32, gradient-tracked
+        hair_image:  torch.Tensor,   # (B, 3, 512, 512) float32 in [0, 1]
     ) -> torch.Tensor:
         """
-        sketch_pred → vae.encode_for_grad → sketch_latent
-                    → transformer(sigma=0, null_cond) → pred_hair_latent
-                    → vae.decode → hair_recon (in [-1, 1])
-        LPIPS(hair_recon, normalize(hair_image))
+        TRUE round-trip cycle (matches original design intent in hair2sketch_head.md):
 
-        The VAE and transformer are frozen (requires_grad=False for their params),
-        but gradients DO flow through them back to sketch_pred because:
-          - vae.encode_for_grad has no torch.no_grad() wrapper
-          - vae.decode has no torch.no_grad() wrapper
-          - transformer back_blocks (12-23) are unfrozen and also receive grads here
+            sketch_pred + matte_pred
+              → forward_controlnet → block_samples (ControlNet residuals)
 
-        NOTE (multi-GPU): self.transformer is NOT wrapped by accelerator.prepare(),
-        so back_blocks gradients accumulated through this call bypass DDP sync.
-        Tested with single-GPU; for multi-GPU use, route through self.model or
-        wrap self.transformer separately.
+            sketch_pred → vae.encode_for_grad → sketch_latent (DiT input)
+
+            DiT(sketch_latent, σ=0, null_cond, controlnet_block_samples=block_samples)
+              → pred_hair_latent (single-step approximation of x0 prediction)
+
+            vae.decode(pred_hair_latent) → hair_recon
+
+            loss = LPIPS(hair_recon, hair_orig)
+
+        Why use matte_pred (not matte_gt):
+          The whole point of cycle is to enable semi-supervised learning on
+          unpaired hair images (no matte_gt available there). Using matte_pred
+          here keeps the path identical between paired and unpaired cases.
+
+        How ControlNet injection works (hook-based, version-agnostic):
+          SD3ControlNetModel produces N block_samples (one per ControlNet layer).
+          Each is added to the IMAGE hidden_states of the corresponding transformer
+          block AFTER its forward pass. We register a forward_hook on each block
+          that adds the residual; hooks are removed in finally to avoid leaks.
+
+        Gradient chain (all paths intentional):
+          LPIPS → hair_recon → vae.decode → pred_hair_latent
+                → DiT (back_blocks 12-23 receive grads)
+                → block_samples → forward_CN (frozen, grads flow through)
+                                → matte_cnn (frozen) → matte_pred → matte_decoder ✓
+                                → vae.encode_for_grad → sketch_pred → stroke_decoder ✓
+                                                                    → feature_extractor ✓
+                → sketch_latent → vae.encode_for_grad → sketch_pred → ... ✓
+
+        autocast(bf16) is required: self.transformer is invoked directly here
+        (not via self.model wrapped by accelerator). LoRA fp32 × bf16 input
+        would error without autocast.
         """
         B      = sketch_pred.shape[0]
         device = sketch_pred.device
         dtype  = sketch_pred.dtype
 
-        # sketch_pred [0,1] → sketch_latent (with grad)
-        sketch_latent = self.vae.encode_for_grad(sketch_pred)   # (B, 16, 64, 64)
-        sketch_latent = sketch_latent.to(dtype=torch.bfloat16)
+        # 1. ControlNet residuals: sketch_pred + matte_pred → block_samples
+        #    enable_grad=True so gradient flows back to sketch_pred AND matte_pred
+        block_samples = self.forward_controlnet._get_features_impl(
+            sketch_pred, matte_pred, enable_grad=True,
+        )
 
-        # Run DiT (sigma=0) on sketch_latent to predict hair-like latent.
-        # No ControlNet injection here for simplicity — bare DiT single-step prediction.
-        # Back_blocks (12-23) are unfrozen and also get LPIPS gradients.
+        # 2. DiT input: sketch_latent (the "noisy" thing the DiT will denoise toward hair)
+        sketch_latent = self.vae.encode_for_grad(sketch_pred).to(dtype=torch.bfloat16)
+
+        # 3. DiT forward with ControlNet injection via hooks
         null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
         null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=torch.bfloat16)
         sigma    = torch.zeros(B, device=device, dtype=torch.bfloat16)
 
-        # Gradient checkpointing on this transformer pass (single biggest activation
-        # source in cycle step). Forward saves no activations; backward recomputes.
-        # Trades ~30% extra compute for ~10GB memory — keeps batch_size=4 viable.
-        # use_reentrant=False: PyTorch >=2.0 API, hook-safe (no double firing).
-        #
-        # autocast(bf16) must wrap this call: self.transformer is invoked DIRECTLY
-        # here (not via self.model which carries accelerator's autocast context).
-        # LoRA parameters are fp32 by default — matmul of bf16 input × fp32 LoRA
-        # would error without autocast. Supervised step works because self.model()
-        # goes through the prepared model with autocast already active.
-        def _tx_fwd(latent, enc, pool, t):
-            return self.transformer(
-                hidden_states=latent,
-                encoder_hidden_states=enc,
-                pooled_projections=pool,
-                timestep=t,
-                return_dict=False,
-            )[0]
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred_hair_latent = checkpoint(
-                _tx_fwd, sketch_latent, null_enc, null_p, sigma,
-                use_reentrant=False,
-            )   # (B, 16, 64, 64)
+        # Hook factory: closure captures `sample` correctly per iteration
+        def make_inject_hook(sample):
+            def _h(_module, _inputs, outputs):
+                # SD3 JointTransformerBlock returns (encoder_hs, image_hs)
+                enc_hs, img_hs = outputs
+                s = sample.to(dtype=img_hs.dtype)
+                # Match seq_len: img_hs may have more tokens than image-only sample
+                n = s.shape[1]
+                if img_hs.shape[1] == n:
+                    new_img_hs = img_hs + s
+                else:
+                    head = img_hs[:, :n, :] + s
+                    new_img_hs = torch.cat([head, img_hs[:, n:, :]], dim=1)
+                return (enc_hs, new_img_hs)
+            return _h
 
-        # Decode to pixel space (VAE params frozen, but grad flows to input)
+        n_inject = min(len(block_samples), len(self.transformer.transformer_blocks))
+        hooks = []
+        try:
+            for i in range(n_inject):
+                hk = self.transformer.transformer_blocks[i].register_forward_hook(
+                    make_inject_hook(block_samples[i])
+                )
+                hooks.append(hk)
+
+            # Gradient checkpointing on this transformer pass (~10GB memory saved).
+            def _tx_fwd(latent, enc, pool, t):
+                return self.transformer(
+                    hidden_states=latent,
+                    encoder_hidden_states=enc,
+                    pooled_projections=pool,
+                    timestep=t,
+                    return_dict=False,
+                )[0]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_hair_latent = checkpoint(
+                    _tx_fwd, sketch_latent, null_enc, null_p, sigma,
+                    use_reentrant=False,
+                )   # (B, 16, 64, 64)
+        finally:
+            for hk in hooks:
+                hk.remove()
+
+        # 4. Decode → image space (VAE frozen, grad flows through)
         hair_recon = self.vae.decode(pred_hair_latent).to(dtype=dtype)  # (B, 3, 512, 512) in [-1,1]
+        hair_ref   = VAEWrapper.normalize(hair_image)                    # (B, 3, 512, 512) in [-1,1]
 
-        # hair_image is [0,1]; normalize to [-1,1] for LPIPS comparison
-        hair_ref = VAEWrapper.normalize(hair_image)   # (B, 3, 512, 512) in [-1,1]
-
-        # LPIPS memory optimization:
-        #  1) downsample 512 → 256 — VGG was pretrained on 224, so 256 is more natural
-        #     and reduces first-layer activation by 4× (the dominant memory cost).
-        #  2) wrap in bf16 autocast — VGG fp32 weights but bf16 activations halve
-        #     memory again. LPIPS scalar value is robust to this precision.
+        # 5. LPIPS at 256×256 + bf16 — VGG memory ~8× cheaper than 512×512 fp32
         recon_lp = F.interpolate(hair_recon.clamp(-1.0, 1.0),
                                   size=(256, 256), mode="bilinear", align_corners=False)
         ref_lp   = F.interpolate(hair_ref.clamp(-1.0, 1.0),
@@ -562,21 +602,53 @@ class InverseHeadTrainer:
         self.model.eval()
         sketch_pred, matte_pred, _ = self.model(hair_image)
 
-        # Phase 2: also compute hair_recon for cycle visualization
-        log_recon = (epoch >= self.cycle_start) and (self.lpips_fn is not None)
+        # Phase 2: compute hair_recon for cycle visualization (same path as training cycle)
+        log_recon = (epoch >= self.cycle_start) and (self.forward_controlnet is not None)
         if log_recon:
-            sketch_latent = self.vae.encode_for_grad(sketch_pred.float()).to(dtype=torch.bfloat16)
-            B = sketch_latent.shape[0]
+            B = hair_image.shape[0]
+            # ControlNet residuals from sketch_pred + matte_pred
+            block_samples = self.forward_controlnet._get_features_impl(
+                sketch_pred.float(), matte_pred.float(), enable_grad=False,
+            )
+            sketch_latent = self.vae.encode(sketch_pred.float()).to(dtype=torch.bfloat16)
             null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
             null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=torch.bfloat16)
             sigma    = torch.zeros(B, device=device, dtype=torch.bfloat16)
-            pred_lat = self.transformer(
-                hidden_states=sketch_latent,
-                encoder_hidden_states=null_enc,
-                pooled_projections=null_p,
-                timestep=sigma,
-                return_dict=False,
-            )[0]
+
+            # Inject block_samples via hooks (same as training cycle)
+            def _make_hook(sample):
+                def _h(_m, _i, outputs):
+                    enc_hs, img_hs = outputs
+                    s = sample.to(dtype=img_hs.dtype)
+                    n = s.shape[1]
+                    if img_hs.shape[1] == n:
+                        new_img = img_hs + s
+                    else:
+                        new_img = torch.cat([img_hs[:, :n] + s, img_hs[:, n:]], dim=1)
+                    return (enc_hs, new_img)
+                return _h
+
+            n_inject = min(len(block_samples), len(self.transformer.transformer_blocks))
+            hooks = []
+            try:
+                for i in range(n_inject):
+                    hooks.append(
+                        self.transformer.transformer_blocks[i].register_forward_hook(
+                            _make_hook(block_samples[i])
+                        )
+                    )
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    pred_lat = self.transformer(
+                        hidden_states=sketch_latent,
+                        encoder_hidden_states=null_enc,
+                        pooled_projections=null_p,
+                        timestep=sigma,
+                        return_dict=False,
+                    )[0]
+            finally:
+                for hk in hooks:
+                    hk.remove()
+
             hair_recon = self.vae.decode(pred_lat)               # [-1, 1]
             hair_recon = VAEWrapper.denormalize(hair_recon).clamp(0, 1)
 

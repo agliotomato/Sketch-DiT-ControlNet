@@ -29,19 +29,26 @@ training:
   warmup_steps: 200
   gradient_clip: 1.0
 
-  # Phase 2: cycle loss 시작 epoch
-  cycle_start: 20   # Phase 1 (supervised) 충분히 학습 후 cycle 추가
+  # Phase 2: cycle loss 시작 epoch — resume from best.pth (epoch=5) → 즉시 phase 2
+  cycle_start: 5    # 5 이상이면 cycle 진입; best.pth는 epoch=5 → resume 시 첫 step부터 alternating
 
   loss_weights:
-    structure: 1.0    # BCE: stroke_mask vs GT
-    color: 0.5        # L1 stroke-weighted: sketch_pred vs sketch_GT
-    matte: 1.0        # BCE + L1 + Dice: matte_pred vs matte_GT
-    tv: 0.01          # Total Variation: stroke mask smoothness
-    cycle: 0.01       # Phase 2: forward ControlNet feature MSE
+    structure: 1.0      # BCE: stroke_mask vs GT
+    color: 0.5          # L1 stroke-weighted: sketch_pred vs sketch_GT
+    matte: 1.0          # BCE + L1 + Dice: matte_pred vs matte_GT
+    tv: 0.01            # Total Variation: stroke mask smoothness
+    cycle: 0.01         # Phase 2: forward ControlNet feature MSE
+    lpips_cycle: 0.05   # Phase 2: TRUE round-trip LPIPS via forward_CN + DiT(CN-injected)
 
-grid_size: 16         # patch color sampling 크기
+# Cycle step memory split: cycle is heavier than supervised (forward_CN + 2nd DiT pass + VGG)
+# Splits cycle batch into N micro-batches with gradient accumulation. supervised step uses full bs.
+cycle_micro_batches: 4    # bs=4 → 4 × bs=1 in cycle step
+
+backbone_lr_scale: 0.1    # back_blocks (12-23) LR = base_lr × 0.1 (gentler fine-tuning)
+
+grid_size: 16             # patch color sampling 크기
 
 checkpointing:
   output_dir: checkpoints/inverse_head/
-  eval_every: 5
-  save_every: 10
+  eval_every: 2     # was 5 — Phase 2에서 cycle 효과 빨리 확인하려면 더 자주
+  save_every: 5     # was 10 — 더 자주 epoch_X.pth 저장 (안전망)
