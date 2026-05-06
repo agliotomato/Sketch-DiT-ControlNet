@@ -235,10 +235,13 @@ def main():
     ssim_fn  = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     psnr_fn  = PeakSignalNoiseRatio(data_range=1.0).to(device)
 
+    from torch.utils.data import ConcatDataset
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = HairRegionDataset(split=args.split)
+    splits = [s.strip() for s in args.split.split(",")]
+    datasets = [HairRegionDataset(split=s) for s in splits]
+    dataset = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
     n       = min(args.num_samples, len(dataset))
 
     lpips_scores, ssim_scores, psnr_scores = [], [], []
