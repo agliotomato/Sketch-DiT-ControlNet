@@ -89,9 +89,10 @@ class FPNMaskDecoder(nn.Module):
         Returns:
             mask: (B, out_channels, 512, 512) in [0, 1]
         """
-        f_e = self.proj_early(features["early"].float())   # (B,  64, 32, 32)
-        f_m = self.proj_mid(features["mid"].float())       # (B, 128, 32, 32)
-        f_l = self.proj_late(features["late"].float())     # (B, 256, 32, 32)
+        dtype = next(self.parameters()).dtype
+        f_e = self.proj_early(features["early"].to(dtype))   # (B,  64, 32, 32)
+        f_m = self.proj_mid(features["mid"].to(dtype))       # (B, 128, 32, 32)
+        f_l = self.proj_late(features["late"].to(dtype))     # (B, 256, 32, 32)
 
         # 32×32 — semantic processing
         x = self.stage_32(f_l)                                        # (B, 256, 32, 32)
