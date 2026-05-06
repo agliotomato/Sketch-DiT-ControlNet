@@ -35,7 +35,7 @@ training:
   loss_weights:
     structure: 1.0      # BCE: stroke_mask vs GT
     color: 0.5          # L1 stroke-weighted: sketch_pred vs sketch_GT
-    matte: 1.0          # BCE + L1 + Dice: matte_pred vs matte_GT
+    matte: 2.0          # BCE + L1 + Dice: matte_pred vs matte_GT
     tv: 0.01            # Total Variation: stroke mask smoothness
     cycle: 0.01         # Phase 2: forward ControlNet feature MSE
     lpips_cycle: 0.05   # Phase 2: TRUE round-trip LPIPS via forward_CN + DiT(CN-injected)
