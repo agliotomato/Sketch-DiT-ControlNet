@@ -404,9 +404,9 @@ class InverseHeadTrainer:
                 agg_log["loss_cycle_feat"] += feat_cycle.item() / n_micro
 
             if lpips_active:
-                # Pass matte_pred (not matte_gt) — true round-trip cycle, semi-supervised compatible
+                # Use matte_gt for masking LPIPS to prevent trivial shortcut (matte_pred -> 0)
                 lpips_loss = self._compute_image_lpips_cycle(
-                    sketch_pred.float(), matte_pred.float(), hair_image.float()
+                    sketch_pred.float(), matte_pred.float(), hair_image.float(), matte_gt.float()
                 )
                 loss_terms.append(self.w_lpips * lpips_loss)
                 agg_log["loss_cycle_lpips"] += lpips_loss.item() / n_micro
@@ -439,6 +439,7 @@ class InverseHeadTrainer:
         sketch_pred: torch.Tensor,   # (B, 3, 512, 512) float32, gradient-tracked
         matte_pred:  torch.Tensor,   # (B, 1, 512, 512) float32, gradient-tracked
         hair_image:  torch.Tensor,   # (B, 3, 512, 512) float32 in [0, 1]
+        matte_gt:    torch.Tensor,   # (B, 1, 512, 512) float32 in [0, 1] - Use GT to prevent shortcut
     ) -> torch.Tensor:
         """
         TRUE round-trip cycle (matches original design intent in hair2sketch_head.md):
@@ -495,7 +496,9 @@ class InverseHeadTrainer:
         # 3. DiT forward with ControlNet injection via hooks
         null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
         null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=torch.bfloat16)
-        sigma    = torch.zeros(B, device=device, dtype=torch.bfloat16)
+        
+        # 1-Step Fix: sigma=1.0 (noise state) instead of 0.0 (image state)
+        sigma    = torch.ones(B, device=device, dtype=torch.bfloat16) * 1.0
 
         # Hook factory: closure captures `sample` correctly per iteration
         def make_inject_hook(sample):
@@ -532,10 +535,13 @@ class InverseHeadTrainer:
                     return_dict=False,
                 )[0]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                pred_hair_latent = checkpoint(
+                v_pred = checkpoint(
                     _tx_fwd, sketch_latent, null_enc, null_p, sigma,
                     use_reentrant=False,
                 )   # (B, 16, 64, 64)
+                
+                # 1-Step Fix: x_0 = x_1 - v_pred (SD3 Flow Matching Euler step)
+                pred_hair_latent = sketch_latent - v_pred
         finally:
             for hk in hooks:
                 hk.remove()
@@ -543,9 +549,9 @@ class InverseHeadTrainer:
         # 4. Decode → image space in [0, 1]
         hair_recon_01 = (self.vae.decode(pred_hair_latent).to(dtype=dtype).clamp(-1.0, 1.0) + 1.0) / 2.0
 
-        # Mask both in [0, 1] space using matte_pred (allows gradient flow)
-        recon_masked = hair_recon_01 * matte_pred.to(dtype=dtype)
-        ref_masked   = hair_image.to(dtype=dtype) * matte_pred.to(dtype=dtype)
+        # Mask both in [0, 1] space using matte_gt (prevents trivial shortcut)
+        recon_masked = hair_recon_01 * matte_gt.to(dtype=dtype)
+        ref_masked   = hair_image.to(dtype=dtype) * matte_gt.to(dtype=dtype)
 
         # Convert back to [-1, 1] for LPIPS
         recon_11 = recon_masked * 2.0 - 1.0
