@@ -540,15 +540,20 @@ class InverseHeadTrainer:
             for hk in hooks:
                 hk.remove()
 
-        # 4. Decode → image space (VAE frozen, grad flows through)
-        hair_recon = self.vae.decode(pred_hair_latent).to(dtype=dtype)  # (B, 3, 512, 512) in [-1,1]
-        hair_ref   = VAEWrapper.normalize(hair_image)                    # (B, 3, 512, 512) in [-1,1]
+        # 4. Decode → image space in [0, 1]
+        hair_recon_01 = (self.vae.decode(pred_hair_latent).to(dtype=dtype).clamp(-1.0, 1.0) + 1.0) / 2.0
+
+        # Mask both in [0, 1] space using matte_pred (allows gradient flow)
+        recon_masked = hair_recon_01 * matte_pred.to(dtype=dtype)
+        ref_masked   = hair_image.to(dtype=dtype) * matte_pred.to(dtype=dtype)
+
+        # Convert back to [-1, 1] for LPIPS
+        recon_11 = recon_masked * 2.0 - 1.0
+        ref_11   = ref_masked * 2.0 - 1.0
 
         # 5. LPIPS at 256×256 + bf16 — VGG memory ~8× cheaper than 512×512 fp32
-        recon_lp = F.interpolate(hair_recon.clamp(-1.0, 1.0),
-                                  size=(256, 256), mode="bilinear", align_corners=False)
-        ref_lp   = F.interpolate(hair_ref.clamp(-1.0, 1.0),
-                                  size=(256, 256), mode="bilinear", align_corners=False)
+        recon_lp = F.interpolate(recon_11, size=(256, 256), mode="bilinear", align_corners=False)
+        ref_lp   = F.interpolate(ref_11, size=(256, 256), mode="bilinear", align_corners=False)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             lpips_val = self.lpips_fn(recon_lp, ref_lp).mean()
         return lpips_val.float()

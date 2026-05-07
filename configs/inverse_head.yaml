@@ -48,7 +48,9 @@ backbone_lr_scale: 0.1    # back_blocks (12-23) LR = base_lr × 0.1 (gentler fin
 
 grid_size: 16             # patch color sampling 크기
 
+run_name: inverse_head_v2
+
 checkpointing:
-  output_dir: checkpoints/inverse_head/
+  output_dir: checkpoints/inverse_head_v2/
   eval_every: 2     # was 5 — Phase 2에서 cycle 효과 빨리 확인하려면 더 자주
   save_every: 5     # was 10 — 더 자주 epoch_X.pth 저장 (안전망)
