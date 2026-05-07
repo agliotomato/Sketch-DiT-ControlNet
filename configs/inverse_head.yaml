@@ -30,7 +30,7 @@ training:
   gradient_clip: 1.0
 
   # Phase 2: cycle loss 시작 epoch — resume from best.pth (epoch=5) → 즉시 phase 2
-  cycle_start: 5    # 5 이상이면 cycle 진입; best.pth는 epoch=5 → resume 시 첫 step부터 alternating
+  cycle_start: 10   # 10 이상이면 cycle 진입; 안전한 워밍업을 위해 10으로 늘림
 
   loss_weights:
     structure: 1.0      # BCE: stroke_mask vs GT
