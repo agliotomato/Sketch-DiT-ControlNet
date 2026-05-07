@@ -251,6 +251,11 @@ class InverseHeadTrainer:
         for epoch in range(self.start_epoch, epochs):
             self._current_epoch = epoch
             phase2 = (epoch >= self.cycle_start)
+            
+            if phase2 and epoch == self.cycle_start:
+                self.accelerator.print("\n" + "="*50)
+                self.accelerator.print("🚀 [Phase 2] 본격적인 Joint 학습 (Supervised + Cycle)을 시작합니다!")
+                self.accelerator.print("="*50 + "\n")
 
             self.model.train()
             epoch_losses = []
@@ -263,9 +268,35 @@ class InverseHeadTrainer:
 
             for batch in progress:
                 # Phase 1: supervised only.
-                # Phase 2: alternate — even steps supervised, odd steps cycle.
-                if phase2 and self.global_step % 2 == 1:
-                    loss, log_dict = self._cycle_step(batch)
+                # Phase 2: Joint training (supervised and cycle on same batch via accumulation)
+                if phase2:
+                    self.optimizer.zero_grad()
+                    
+                    # 1. Supervised pass
+                    loss_sup, log_sup = self._supervised_step(batch, update_optimizer=False)
+                    
+                    # 2. Cycle pass (micro-batched)
+                    loss_cyc, log_cyc = self._cycle_step(batch, update_optimizer=False)
+                    
+                    # 3. Update weights
+                    if self.cfg["training"].get("gradient_clip"):
+                        self.accelerator.clip_grad_norm_(
+                            [p for p in self.model.parameters() if p.requires_grad],
+                            self.cfg["training"]["gradient_clip"],
+                        )
+                    self.optimizer.step()
+                    
+                    # 4. Merge logs
+                    loss = loss_sup + loss_cyc
+                    log_dict = {
+                        **log_cyc,  # brings in loss_cycle_feat, loss_cycle_lpips
+                        "loss_structure": log_sup.get("loss_structure", 0.0),
+                        "loss_color":     log_sup.get("loss_color", 0.0),
+                        "loss_matte":     log_sup.get("loss_matte", 0.0),
+                        "loss_tv":        log_sup.get("loss_tv", 0.0),
+                        "loss_total":     log_sup["loss_total"] + log_cyc["loss_total"],
+                        "step_type":      2.0,  # 2.0 denotes Joint step
+                    }
                 else:
                     loss, log_dict = self._supervised_step(batch)
 
@@ -310,7 +341,7 @@ class InverseHeadTrainer:
         self._save("final.pth", epochs - 1)
         self.accelerator.end_training()
 
-    def _supervised_step(self, batch: dict) -> tuple[torch.Tensor, dict]:
+    def _supervised_step(self, batch: dict, update_optimizer: bool = True) -> tuple[torch.Tensor, dict]:
         """Supervised loss only: structure BCE + color L1 + matte losses + TV."""
         device = self.accelerator.device
         dtype  = torch.bfloat16
@@ -319,7 +350,8 @@ class InverseHeadTrainer:
         sketch_gt  = batch["sketch"].to(device, dtype=dtype)
         matte_gt   = batch["matte"].to(device, dtype=dtype)
 
-        self.optimizer.zero_grad()
+        if update_optimizer:
+            self.optimizer.zero_grad()
 
         sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
 
@@ -338,15 +370,18 @@ class InverseHeadTrainer:
         log_dict["step_type"]  = 0.0           # supervised=0 for logging
 
         self.accelerator.backward(loss)
-        if self.cfg["training"].get("gradient_clip"):
-            self.accelerator.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                self.cfg["training"]["gradient_clip"],
-            )
-        self.optimizer.step()
+        
+        if update_optimizer:
+            if self.cfg["training"].get("gradient_clip"):
+                self.accelerator.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    self.cfg["training"]["gradient_clip"],
+                )
+            self.optimizer.step()
+            
         return loss, log_dict
 
-    def _cycle_step(self, batch: dict) -> tuple[torch.Tensor, dict]:
+    def _cycle_step(self, batch: dict, update_optimizer: bool = True) -> tuple[torch.Tensor, dict]:
         """Cycle loss step (phase 2): feature MSE + image-space LPIPS cycle.
 
         Memory: cycle adds forward_CN forward + DiT 2nd pass + VAE decode + VGG.
@@ -360,7 +395,7 @@ class InverseHeadTrainer:
         feat_active  = self.forward_controlnet is not None and self.w_cycle > 0
         lpips_active = self.w_lpips > 0 and self.lpips_fn is not None
         if not feat_active and not lpips_active:
-            return self._supervised_step(batch)
+            return self._supervised_step(batch, update_optimizer=update_optimizer)
 
         device = self.accelerator.device
         dtype  = torch.bfloat16
@@ -374,7 +409,8 @@ class InverseHeadTrainer:
         n_micro   = max(1, min(n_micro, bs))
         chunk_sz  = (bs + n_micro - 1) // n_micro
 
-        self.optimizer.zero_grad()
+        if update_optimizer:
+            self.optimizer.zero_grad()
         agg_log: dict = {"loss_cycle_feat": 0.0, "loss_cycle_lpips": 0.0, "loss_total": 0.0}
         agg_total: float = 0.0
 
@@ -423,12 +459,13 @@ class InverseHeadTrainer:
             if lpips_active:
                 del lpips_loss
 
-        if self.cfg["training"].get("gradient_clip"):
-            self.accelerator.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                self.cfg["training"]["gradient_clip"],
-            )
-        self.optimizer.step()
+        if update_optimizer:
+            if self.cfg["training"].get("gradient_clip"):
+                self.accelerator.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    self.cfg["training"]["gradient_clip"],
+                )
+            self.optimizer.step()
 
         agg_log["loss_total"] = agg_total
         agg_log["step_type"]  = 1.0
