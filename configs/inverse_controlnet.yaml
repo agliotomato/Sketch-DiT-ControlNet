@@ -17,6 +17,7 @@ base: configs/base.yaml
 model:
   model_id: stabilityai/stable-diffusion-3.5-medium
   num_controlnet_layers: 12
+  use_sketch_decoder: true   # decoder head cycle loss (block_samples → sketch_pred)
 
 training:
   mode: inverse             # condition swap: hair → sketch

@@ -234,11 +234,20 @@ class Trainer:
         cfg = self.cfg["training"]
         aug = build_augmentation_pipeline(self.phase)
 
-        split_train = f"{cfg['dataset']}_train"
-        split_val   = f"{cfg['dataset']}_test"
-
-        train_ds = HairRegionDataset(split=split_train, augmentation=aug)
-        val_ds   = HairRegionDataset(split=split_val)
+        dataset_name = cfg["dataset"]
+        if dataset_name == "both":
+            from torch.utils.data import ConcatDataset
+            train_ds = ConcatDataset([
+                HairRegionDataset(split="unbraid_train", augmentation=aug),
+                HairRegionDataset(split="braid_train",   augmentation=aug),
+            ])
+            val_ds = ConcatDataset([
+                HairRegionDataset(split="unbraid_test"),
+                HairRegionDataset(split="braid_test"),
+            ])
+        else:
+            train_ds = HairRegionDataset(split=f"{dataset_name}_train", augmentation=aug)
+            val_ds   = HairRegionDataset(split=f"{dataset_name}_test")
 
         bs = cfg.get("batch_size", 4)
         self.train_loader = DataLoader(
