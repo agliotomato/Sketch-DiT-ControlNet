@@ -74,6 +74,11 @@ def load_image(path: Path, size: int = 512) -> torch.Tensor:
     return transforms.ToTensor()(img).unsqueeze(0)   # (1, 3, H, W) in [0, 1]
 
 
+def load_matte(path: Path, size: int = 512) -> torch.Tensor:
+    matte = Image.open(path).convert("L").resize((size, size), Image.LANCZOS)
+    return transforms.ToTensor()(matte).unsqueeze(0)   # (1, 1, H, W) in [0, 1]
+
+
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
@@ -82,13 +87,15 @@ def load_image(path: Path, size: int = 512) -> torch.Tensor:
 def infer(
     model: HairToSketchDiT,
     hair_image: torch.Tensor,
+    matte: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (sketch_pred, matte_pred) each (1, *, 512, 512) float in [0, 1]."""
-    hair = hair_image.to(device=device, dtype=dtype)
-    sketch_pred, matte_pred, _ = model(hair)
-    return sketch_pred.float().clamp(0, 1), matte_pred.float().clamp(0, 1)
+) -> torch.Tensor:
+    """Returns sketch_pred (1, 3, 512, 512) float in [0, 1]."""
+    hair  = hair_image.to(device=device, dtype=dtype)
+    matte = matte.to(device=device, dtype=dtype)
+    sketch_pred, _ = model(hair, matte)
+    return sketch_pred.float().clamp(0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +104,10 @@ def infer(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True, help="checkpoints/inverse_head/best.pth")
-    parser.add_argument("--config",     required=True, help="configs/inverse_head.yaml")
-    parser.add_argument("--input",      required=True, help="이미지 파일 또는 디렉토리")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--config",     required=True)
+    parser.add_argument("--input",      required=True, help="hair 이미지 파일 또는 디렉토리")
+    parser.add_argument("--matte_dir",  required=True, help="GT matte 디렉토리 (또는 SHS/BiSeNet 출력)")
     parser.add_argument("--output_dir", default="outputs/inverse_head/")
     parser.add_argument("--size",       type=int, default=512)
     args = parser.parse_args()
@@ -156,15 +164,22 @@ def main():
     else:
         files = [input_path]
 
+    matte_dir = Path(args.matte_dir)
+
     print(f"{len(files)} image(s) → {output_dir}")
     for fpath in files:
         stem       = fpath.stem
+        matte_path = matte_dir / f"{stem}.png"
+        if not matte_path.exists():
+            print(f"  {stem}: matte not found ({matte_path}), skipping")
+            continue
+
         hair_image = load_image(fpath, size=args.size)
-        sketch, matte = infer(model, hair_image, device, dtype)
+        matte      = load_matte(matte_path, size=args.size)
+        sketch     = infer(model, hair_image, matte, device, dtype)
 
         save_image(sketch, output_dir / f"{stem}_sketch.png")
-        save_image(matte,  output_dir / f"{stem}_matte.png")
-        print(f"  {stem}: sketch + matte saved")
+        print(f"  {stem}: sketch saved")
 
     print("Done.")
 
