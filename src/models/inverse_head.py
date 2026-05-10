@@ -117,12 +117,12 @@ class FPNMaskDecoder(nn.Module):
 
 class HairToSketchDiT(nn.Module):
     """
-    Full inverse model: Hair image → Sketch + Matte.
+    Full inverse model: Hair image → Sketch only.
+    Matte is handled externally (GT during training, SHS/BiSeNet at inference).
 
     Trainable:
-      - DiTFeatureExtractor.lora_modules  (LoRA on 3 DiT blocks' attention)
+      - DiTFeatureExtractor.lora_modules  (LoRA on front DiT blocks' attention)
       - stroke_decoder (FPNMaskDecoder)
-      - matte_decoder  (FPNMaskDecoder)
 
     Frozen:
       - VAE encoder
@@ -153,22 +153,22 @@ class HairToSketchDiT(nn.Module):
 
         hidden_dim = transformer.inner_dim   # 1536 for SD3.5-medium
         self.stroke_decoder = FPNMaskDecoder(hidden_dim, out_channels=1)
-        self.matte_decoder  = FPNMaskDecoder(hidden_dim, out_channels=1)
 
     def forward(
         self,
         hair_image: torch.Tensor,   # (B, 3, 512, 512) in [0, 1]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        matte: torch.Tensor,        # (B, 1, 512, 512) — GT during training, external model at inference
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             sketch_pred: (B, 3, 512, 512)
-            matte_pred:  (B, 1, 512, 512)
             stroke_mask: (B, 1, 512, 512)
         """
         dtype  = next(self.stroke_decoder.parameters()).dtype
         device = next(self.stroke_decoder.parameters()).device
 
         hair = hair_image.to(device=device, dtype=dtype)
+        matte = matte.to(device=device, dtype=dtype)
 
         # 1. Frozen VAE encoder
         with torch.no_grad():
@@ -177,14 +177,13 @@ class HairToSketchDiT(nn.Module):
         # 2. DiT feature extraction (LoRA trainable, DiT base frozen)
         features = self.feature_extractor(hair_latent)    # {early, mid, late}
 
-        # 3. Decode stroke mask and matte
+        # 3. Decode stroke mask
         stroke_mask = self.stroke_decoder(features)       # (B, 1, 512, 512)
-        matte_pred  = self.matte_decoder(features)        # (B, 1, 512, 512)
 
-        # 4. Non-parametric color sampling (no learned color decoder)
-        hair_masked = hair * matte_pred
+        # 4. Non-parametric color sampling using external matte
+        hair_masked = hair * matte
         sketch_pred = patch_color_sample(
             hair_masked.float(), stroke_mask.float(), self.grid_size
         ).to(dtype=dtype)
 
-        return sketch_pred, matte_pred, stroke_mask
+        return sketch_pred, stroke_mask

@@ -1,0 +1,24 @@
+# Step 1: Back blocks bidirectional update + GT matte
+# - bidirectional: odd steps = forward FM (back_blocks only), even steps = inverse supervised
+# - use_gt_matte: sketch color sampling uses GT matte (isolates sketch from matte error)
+# - cycle_start: 9999 (cycle loss off for now — focus on bidirectional effect first)
+base: configs/inverse_head.yaml
+
+bidirectional: true
+bidir_batch_mode: "alternating"
+use_gt_matte: true
+w_fm_forward: 0.1       # forward FM loss weight (scale relative to inverse losses)
+
+training:
+  cycle_start: 9999     # cycle loss off — ablate bidirectional effect in isolation
+  loss_weights:
+    structure: 1.0
+    color: 0.5
+    tv: 0.01
+
+checkpointing:
+  output_dir: checkpoints/inverse_bidir_step1/
+  eval_every: 2
+  save_every: 5
+
+run_name: inverse_bidir_step1

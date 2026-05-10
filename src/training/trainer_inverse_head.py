@@ -78,9 +78,13 @@ class InverseHeadTrainer:
 
         # --- Frozen forward ControlNet (phase 2 feature cycle + LPIPS cycle) ---
         self.forward_controlnet: HairControlNet | None = None
-        self.w_cycle     = tcfg["loss_weights"].get("cycle", 0.01)
-        self.w_lpips     = tcfg["loss_weights"].get("lpips_cycle", 0.05)
-        self.cycle_start = tcfg.get("cycle_start", 9999)
+        self.w_cycle          = tcfg["loss_weights"].get("cycle", 0.01)
+        self.w_lpips          = tcfg["loss_weights"].get("lpips_cycle", 0.05)
+        self.cycle_start      = tcfg.get("cycle_start", 9999)
+        self.use_gt_matte     = config.get("use_gt_matte", False)
+        self.bidirectional    = config.get("bidirectional", False)
+        self.bidir_batch_mode = config.get("bidir_batch_mode", "alternating")
+        self.w_fm_forward     = config.get("w_fm_forward", 0.1)
         if (self.w_cycle > 0 or self.w_lpips > 0) and Path(controlnet_ckpt).exists():
             fwd_cn = HairControlNet(
                 model_id=model_id, vae=self.vae,
@@ -186,7 +190,6 @@ class InverseHeadTrainer:
         self.loss_fn = InversionLoss(
             w_structure=lw.get("structure", 1.0),
             w_color=lw.get("color", 0.5),
-            w_matte=lw.get("matte", 1.0),
         )
         self.w_tv = lw.get("tv", 0.01)
 
@@ -221,11 +224,12 @@ class InverseHeadTrainer:
             config=_flatten(config),
         )
 
-        self.global_step   = 0
-        self.best_val_loss = float("inf")
-        self.start_epoch   = 0
+        self.global_step    = 0
+        self.best_val_loss  = float("inf")
+        self.start_epoch    = 0
         self._current_epoch = 0
         self._restore_training_state()
+        self._setup_stage(config)
 
     def _restore_training_state(self):
         resume = self.cfg.get("training", {}).get("resume")
@@ -241,6 +245,48 @@ class InverseHeadTrainer:
         self.accelerator.print(
             f"Resumed from {resume} (epoch {self.start_epoch}, step {self.global_step})"
         )
+
+    def _setup_stage(self, config: dict) -> None:
+        """Stage-specific model setup (called after checkpoint restore)."""
+        stage = config.get("stage", 2)
+        feat  = self.accelerator.unwrap_model(self.model).feature_extractor
+
+        if stage == 2:
+            # Forward LoRA frozen; inverse LoRA trains from scratch (or warm-started).
+            feat.freeze_forward_lora()
+
+            # Optional: load old LoRA weights into forward adapter as better init base.
+            old_ckpt = config.get("forward_lora_init_from")
+            if old_ckpt and Path(old_ckpt).exists():
+                self._load_old_lora_as_forward(old_ckpt)
+                self.accelerator.print(f"[Stage 2] Loaded old LoRA → forward adapter from {old_ckpt}")
+
+            # Warm-start inverse LoRA from forward LoRA.
+            if config.get("init_inverse_from_forward", True):
+                feat.init_inverse_from_forward()
+                self.accelerator.print("[Stage 2] Inverse LoRA initialized from Forward LoRA.")
+
+        elif stage == 3:
+            # Both LoRAs trainable; gradient routing via mode switching.
+            feat.unfreeze_forward_lora()
+            self.accelerator.print("[Stage 3] Both LoRAs unfrozen for bidirectional alternating.")
+
+        feat.set_lora_mode("inverse")   # default mode
+
+    def _load_old_lora_as_forward(self, path: str) -> None:
+        """Load a Stage-1/Exp-2 checkpoint's LoRALinear weights into fwd_A/fwd_B."""
+        ckpt      = torch.load(path, map_location="cpu", weights_only=True)
+        old_state = ckpt.get("model", ckpt)
+        feat      = self.accelerator.unwrap_model(self.model).feature_extractor
+        for i, mod in enumerate(feat.lora_modules):
+            a_key = f"feature_extractor.lora_modules.{i}.lora_A"
+            b_key = f"feature_extractor.lora_modules.{i}.lora_B"
+            if a_key in old_state:
+                mod.fwd_A.data.copy_(old_state[a_key].to(mod.fwd_A.device))
+                mod.fwd_B.data.copy_(old_state[b_key].to(mod.fwd_B.device))
+
+    def _set_lora_mode(self, mode: str) -> None:
+        self.accelerator.unwrap_model(self.model).feature_extractor.set_lora_mode(mode)
 
     def train(self):
         tcfg       = self.cfg["training"]
@@ -267,35 +313,36 @@ class InverseHeadTrainer:
             )
 
             for batch in progress:
-                # Phase 1: supervised only.
-                # Phase 2: Joint training (supervised and cycle on same batch via accumulation)
-                if phase2:
+                # Bidirectional alternating: odd steps → forward FM (back_blocks only)
+                #                            even steps → inverse (supervised [+ cycle])
+                is_fwd_step = self.bidirectional and (self.global_step % 2 == 1)
+
+                if is_fwd_step:
+                    loss, log_dict = self._forward_fm_step(batch)
+
+                elif phase2:
+                    # Phase 2: supervised + cycle joint (even steps)
                     self.optimizer.zero_grad()
-                    
-                    # 1. Supervised pass
+
                     loss_sup, log_sup = self._supervised_step(batch, update_optimizer=False)
-                    
-                    # 2. Cycle pass (micro-batched)
                     loss_cyc, log_cyc = self._cycle_step(batch, update_optimizer=False)
-                    
-                    # 3. Update weights
+
                     if self.cfg["training"].get("gradient_clip"):
                         self.accelerator.clip_grad_norm_(
                             [p for p in self.model.parameters() if p.requires_grad],
                             self.cfg["training"]["gradient_clip"],
                         )
                     self.optimizer.step()
-                    
-                    # 4. Merge logs
+
                     loss = loss_sup + loss_cyc
                     log_dict = {
-                        **log_cyc,  # brings in loss_cycle_feat, loss_cycle_lpips
+                        **log_cyc,
                         "loss_structure": log_sup.get("loss_structure", 0.0),
                         "loss_color":     log_sup.get("loss_color", 0.0),
                         "loss_matte":     log_sup.get("loss_matte", 0.0),
                         "loss_tv":        log_sup.get("loss_tv", 0.0),
                         "loss_total":     log_sup["loss_total"] + log_cyc["loss_total"],
-                        "step_type":      2.0,  # 2.0 denotes Joint step
+                        "step_type":      2.0,
                     }
                 else:
                     loss, log_dict = self._supervised_step(batch)
@@ -342,7 +389,9 @@ class InverseHeadTrainer:
         self.accelerator.end_training()
 
     def _supervised_step(self, batch: dict, update_optimizer: bool = True) -> tuple[torch.Tensor, dict]:
-        """Supervised loss only: structure BCE + color L1 + matte losses + TV."""
+        """Supervised loss only: structure BCE + color L1 + TV."""
+        self._set_lora_mode("inverse")
+
         device = self.accelerator.device
         dtype  = torch.bfloat16
 
@@ -353,21 +402,19 @@ class InverseHeadTrainer:
         if update_optimizer:
             self.optimizer.zero_grad()
 
-        sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
+        sketch_pred, stroke_mask = self.model(hair_image, matte_gt)
 
         loss, log_dict = self.loss_fn(
             stroke_mask_pred=stroke_mask,
             sketch_pred=sketch_pred,
-            matte_pred=matte_pred,
             sketch_gt=sketch_gt,
-            matte_gt=matte_gt,
         )
 
         l_tv = tv_loss(stroke_mask.float())
         loss = loss + self.w_tv * l_tv
         log_dict["loss_tv"]    = l_tv.item()
-        log_dict["loss_total"] = loss.item()   # refresh after TV term
-        log_dict["step_type"]  = 0.0           # supervised=0 for logging
+        log_dict["loss_total"] = loss.item()
+        log_dict["step_type"]  = 0.0
 
         self.accelerator.backward(loss)
         
@@ -420,7 +467,7 @@ class InverseHeadTrainer:
             sketch_gt  = full_sketch[s]
             matte_gt   = full_matte[s]
 
-            sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
+            sketch_pred, stroke_mask = self.model(hair_image, matte_gt)
 
             loss_terms: list[torch.Tensor] = []
 
@@ -440,20 +487,17 @@ class InverseHeadTrainer:
                 agg_log["loss_cycle_feat"] += feat_cycle.item() / n_micro
 
             if lpips_active:
-                # Use matte_gt for masking LPIPS to prevent trivial shortcut (matte_pred -> 0)
                 lpips_loss = self._compute_image_lpips_cycle(
-                    sketch_pred.float(), matte_pred.float(), hair_image.float(), matte_gt.float()
+                    sketch_pred.float(), matte_gt.float(), hair_image.float(),
                 )
                 loss_terms.append(self.w_lpips * lpips_loss)
                 agg_log["loss_cycle_lpips"] += lpips_loss.item() / n_micro
 
             micro_total = sum(loss_terms[1:], loss_terms[0])
-            # Scale by 1/n_micro for proper averaging across micro-batches
             self.accelerator.backward(micro_total / n_micro)
             agg_total += micro_total.item() / n_micro
 
-            # Free graph references between micro-batches
-            del sketch_pred, matte_pred, stroke_mask, micro_total, loss_terms
+            del sketch_pred, stroke_mask, micro_total, loss_terms
             if feat_active:
                 del block_pred, block_gt, feat_cycle
             if lpips_active:
@@ -471,12 +515,110 @@ class InverseHeadTrainer:
         agg_log["step_type"]  = 1.0
         return torch.tensor(agg_total, device=device), agg_log
 
+    def _forward_fm_step(self, batch: dict, update_optimizer: bool = True) -> tuple[torch.Tensor, dict]:
+        """Forward flow matching step: sketch_gt + matte_gt → hair (rectified flow).
+
+        Forward LoRA (Stage 3) + back_blocks receive gradients.
+        Inverse LoRA and FPN decoders are not in this path.
+        Requires forward_controlnet to be available.
+        """
+        self._set_lora_mode("forward")
+
+        if self.forward_controlnet is None:
+            return torch.tensor(0.0, device=self.accelerator.device), {
+                "loss_fm_forward": 0.0, "loss_total": 0.0, "step_type": 3.0,
+            }
+
+        device = self.accelerator.device
+        dtype  = torch.bfloat16
+
+        hair      = batch["img"].to(device, dtype=dtype)
+        sketch_gt = batch["sketch"].to(device, dtype=dtype)
+        matte_gt  = batch["matte"].to(device, dtype=dtype)
+        B = hair.shape[0]
+
+        if update_optimizer:
+            self.optimizer.zero_grad()
+
+        with torch.no_grad():
+            hair_latent = self.vae.encode(hair)   # (B, 16, 64, 64)
+
+        # Rectified flow: x_t = (1-t)*x_0 + t*noise,  v_target = noise - x_0
+        t     = torch.rand(B, device=device, dtype=dtype)
+        noise = torch.randn_like(hair_latent)
+        x_t   = (1 - t.view(B, 1, 1, 1)) * hair_latent + t.view(B, 1, 1, 1) * noise
+        v_target = (noise - hair_latent).detach()
+
+        # ControlNet conditioning (frozen, no grad)
+        with torch.no_grad():
+            block_samples = self.forward_controlnet._get_features_impl(
+                sketch_gt.float(), matte_gt.float(), enable_grad=False,
+            )
+
+        null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=dtype)
+        null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=dtype)
+
+        def make_inject_hook(sample):
+            def _h(_module, _inputs, outputs):
+                enc_hs, img_hs = outputs
+                s = sample.to(dtype=img_hs.dtype)
+                n = s.shape[1]
+                if img_hs.shape[1] == n:
+                    return (enc_hs, img_hs + s)
+                return (enc_hs, torch.cat([img_hs[:, :n] + s, img_hs[:, n:]], dim=1))
+            return _h
+
+        n_inject = min(len(block_samples), len(self.transformer.transformer_blocks))
+        hooks = []
+        try:
+            for i in range(n_inject):
+                hooks.append(
+                    self.transformer.transformer_blocks[i].register_forward_hook(
+                        make_inject_hook(block_samples[i])
+                    )
+                )
+
+            def _tx_fwd(latent, enc, pool, t_):
+                return self.transformer(
+                    hidden_states=latent,
+                    encoder_hidden_states=enc,
+                    pooled_projections=pool,
+                    timestep=t_,
+                    return_dict=False,
+                )[0]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                v_pred = checkpoint(
+                    _tx_fwd, x_t, null_enc, null_p, t,
+                    use_reentrant=False,
+                )
+        finally:
+            for hk in hooks:
+                hk.remove()
+
+        fm_loss = F.mse_loss(v_pred.float(), v_target.float()) * self.w_fm_forward
+        self.accelerator.backward(fm_loss)
+
+        if update_optimizer:
+            if self.cfg["training"].get("gradient_clip"):
+                self.accelerator.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    self.cfg["training"]["gradient_clip"],
+                )
+            self.optimizer.step()
+
+        log = {
+            "loss_fm_forward": fm_loss.item() / max(self.w_fm_forward, 1e-8),
+            "loss_total":      fm_loss.item(),
+            "step_type":       3.0,
+        }
+        return fm_loss, log
+
     def _compute_image_lpips_cycle(
         self,
         sketch_pred: torch.Tensor,   # (B, 3, 512, 512) float32, gradient-tracked
-        matte_pred:  torch.Tensor,   # (B, 1, 512, 512) float32, gradient-tracked
+        matte_gt:    torch.Tensor,   # (B, 1, 512, 512) float32 in [0, 1]
         hair_image:  torch.Tensor,   # (B, 3, 512, 512) float32 in [0, 1]
-        matte_gt:    torch.Tensor,   # (B, 1, 512, 512) float32 in [0, 1] - Use GT to prevent shortcut
     ) -> torch.Tensor:
         """
         TRUE round-trip cycle (matches original design intent in hair2sketch_head.md):
@@ -521,10 +663,9 @@ class InverseHeadTrainer:
         device = sketch_pred.device
         dtype  = sketch_pred.dtype
 
-        # 1. ControlNet residuals: sketch_pred + matte_pred → block_samples
-        #    enable_grad=True so gradient flows back to sketch_pred AND matte_pred
+        # 1. ControlNet residuals: sketch_pred + matte_gt → block_samples
         block_samples = self.forward_controlnet._get_features_impl(
-            sketch_pred, matte_pred, enable_grad=True,
+            sketch_pred, matte_gt, enable_grad=True,
         )
 
         # 2. DiT input: sketch_latent (the "noisy" thing the DiT will denoise toward hair)
@@ -613,8 +754,8 @@ class InverseHeadTrainer:
             sketch_gt  = batch["sketch"].to(device, dtype=dtype)
             matte_gt   = batch["matte"].to(device, dtype=dtype)
 
-            sketch_pred, matte_pred, stroke_mask = self.model(hair_image)
-            _, log = self.loss_fn(stroke_mask, sketch_pred, matte_pred, sketch_gt, matte_gt)
+            sketch_pred, stroke_mask = self.model(hair_image, matte_gt)
+            _, log = self.loss_fn(stroke_mask, sketch_pred, sketch_gt)
             total += log["loss_total"]
             n += 1
 
@@ -648,7 +789,7 @@ class InverseHeadTrainer:
         matte_gt   = batch["matte"][:n_samples]
 
         self.model.eval()
-        sketch_pred, matte_pred, _ = self.model(hair_image)
+        sketch_pred, _ = self.model(hair_image, matte_gt.to(device, dtype=dtype))
 
         # Phase 2: compute hair_recon for cycle visualization (same path as training cycle)
         log_recon = (epoch >= self.cycle_start) and (self.forward_controlnet is not None)
@@ -703,19 +844,16 @@ class InverseHeadTrainer:
         def to_np(t):
             return (t.float().cpu().numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
 
-        cap = "hair | sketch_pred | sketch_GT | matte_pred | matte_GT"
+        cap = "hair | sketch_pred | sketch_GT"
         if log_recon:
             cap += " | hair_recon (cycle)"
 
-        # Build panels as raw numpy arrays (HWC uint8)
         panel_arrays = []
         for i in range(min(n_samples, hair_image.shape[0])):
             cols = [
                 to_np(hair_image)[i],
                 to_np(sketch_pred)[i],
                 to_np(sketch_gt)[i],
-                to_np(matte_pred.repeat(1, 3, 1, 1))[i],
-                to_np(matte_gt.repeat(1, 3, 1, 1))[i],
             ]
             if log_recon:
                 cols.append(to_np(hair_recon)[i])

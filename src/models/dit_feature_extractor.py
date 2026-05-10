@@ -30,23 +30,42 @@ import torch.nn as nn
 from diffusers import SD3Transformer2DModel
 
 
-class LoRALinear(nn.Module):
+class DualLoRALinear(nn.Module):
     """
-    Drop-in replacement for nn.Linear with low-rank adaptation.
-    Base weights are frozen; only lora_A and lora_B are trained.
+    Two independent LoRA adapters on one frozen base Linear: 'forward' and 'inverse'.
+    Active adapter is selected by set_mode(). Only that adapter is in the compute graph,
+    so gradients naturally route to the correct adapter without explicit masking.
+
+    Forward adapter: used during forward FM steps (Stage 3).
+    Inverse adapter: used during inverse supervised steps (Stage 2 & 3).
     """
 
     def __init__(self, base: nn.Linear, rank: int = 8, alpha: float = 8.0):
         super().__init__()
-        self.base   = base
-        d_in        = base.in_features
-        d_out       = base.out_features
-        self.lora_A = nn.Parameter(torch.randn(rank, d_in) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
-        self.scale  = alpha / rank
+        self.base  = base
+        d_in, d_out = base.in_features, base.out_features
+        self.scale = alpha / rank
+
+        self.fwd_A = nn.Parameter(torch.randn(rank, d_in) * 0.01)
+        self.fwd_B = nn.Parameter(torch.zeros(d_out, rank))
+        self.inv_A = nn.Parameter(torch.randn(rank, d_in) * 0.01)
+        self.inv_B = nn.Parameter(torch.zeros(d_out, rank))
+
+        self._mode = "inverse"
+
+    def set_mode(self, mode: str) -> None:
+        assert mode in ("forward", "inverse"), f"Unknown LoRA mode: {mode}"
+        self._mode = mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        base_out = self.base(x)
+        if self._mode == "forward":
+            return base_out + (x @ self.fwd_A.T @ self.fwd_B.T) * self.scale
+        return base_out + (x @ self.inv_A.T @ self.inv_B.T) * self.scale
+
+    def init_inverse_from_forward(self) -> None:
+        self.inv_A.data.copy_(self.fwd_A.data)
+        self.inv_B.data.copy_(self.fwd_B.data)
 
 
 class DiTFeatureExtractor(nn.Module):
@@ -98,15 +117,39 @@ class DiTFeatureExtractor(nn.Module):
             p.requires_grad_(True)
 
     def _inject_lora(self, rank: int, alpha: float) -> None:
-        """Replace to_q/to_k/to_v in front NUM_FRONT_LORA blocks with LoRALinear wrappers."""
+        """Replace to_q/to_k/to_v in front NUM_FRONT_LORA blocks with DualLoRALinear."""
         for idx in range(self.NUM_FRONT_LORA):
             attn = self._transformer.transformer_blocks[idx].attn
             for attr in ("to_q", "to_k", "to_v"):
                 linear = getattr(attn, attr, None)
                 if isinstance(linear, nn.Linear):
-                    lora = LoRALinear(linear, rank, alpha)
+                    lora = DualLoRALinear(linear, rank, alpha)
                     setattr(attn, attr, lora)
                     self.lora_modules.append(lora)
+
+    # ------------------------------------------------------------------
+    # LoRA mode control
+    # ------------------------------------------------------------------
+
+    def set_lora_mode(self, mode: str) -> None:
+        """Switch all DualLoRALinear adapters to 'forward' or 'inverse' mode."""
+        for m in self.lora_modules:
+            m.set_mode(mode)
+
+    def init_inverse_from_forward(self) -> None:
+        """Warm-start: copy forward LoRA weights into inverse LoRA (Stage 2 init)."""
+        for m in self.lora_modules:
+            m.init_inverse_from_forward()
+
+    def freeze_forward_lora(self) -> None:
+        for m in self.lora_modules:
+            m.fwd_A.requires_grad_(False)
+            m.fwd_B.requires_grad_(False)
+
+    def unfreeze_forward_lora(self) -> None:
+        for m in self.lora_modules:
+            m.fwd_A.requires_grad_(True)
+            m.fwd_B.requires_grad_(True)
 
     def forward(self, hair_latent: torch.Tensor) -> dict[str, torch.Tensor]:
         """

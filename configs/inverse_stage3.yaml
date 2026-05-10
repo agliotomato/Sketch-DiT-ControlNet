@@ -1,0 +1,32 @@
+# Stage 3: Bidirectional alternating refinement
+# - Forward LoRA unfrozen (gets gradient from forward FM steps)
+# - Inverse LoRA gets gradient from inverse supervised steps
+# - Back blocks (12-23) shared, updated by both (alternating)
+# - Cycle loss enabled after cycle_start epochs
+# Resume from Stage 2 checkpoint.
+base: configs/inverse_head.yaml
+
+stage: 3
+bidirectional: true
+bidir_batch_mode: "alternating"
+use_gt_matte: true
+w_fm_forward: 0.1
+
+training:
+  epochs: 50
+  resume: checkpoints/inverse_stage2/best.pth
+  cycle_start: 10
+  learning_rate: 5.0e-5    # lower than stage 2 — refinement phase
+  loss_weights:
+    structure: 1.0
+    color: 0.5
+    tv: 0.01
+    cycle: 0.01
+    lpips_cycle: 0.05
+
+checkpointing:
+  output_dir: checkpoints/inverse_stage3/
+  eval_every: 2
+  save_every: 5
+
+run_name: inverse_stage3
