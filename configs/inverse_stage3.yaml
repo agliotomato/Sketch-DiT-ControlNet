@@ -10,7 +10,7 @@ stage: 3
 bidirectional: true
 bidir_batch_mode: "alternating"
 use_gt_matte: true
-w_fm_forward: 0.1
+w_fm_forward: 0.05
 
 training:
   epochs: 50

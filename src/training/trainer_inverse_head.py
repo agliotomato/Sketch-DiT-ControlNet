@@ -795,9 +795,8 @@ class InverseHeadTrainer:
         log_recon = (epoch >= self.cycle_start) and (self.forward_controlnet is not None)
         if log_recon:
             B = hair_image.shape[0]
-            # ControlNet residuals from sketch_pred + matte_pred
             block_samples = self.forward_controlnet._get_features_impl(
-                sketch_pred.float(), matte_pred.float(), enable_grad=False,
+                sketch_pred.float(), matte_gt.to(device, dtype=torch.float32), enable_grad=False,
             )
             sketch_latent = self.vae.encode(sketch_pred.float()).to(dtype=torch.bfloat16)
             null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
