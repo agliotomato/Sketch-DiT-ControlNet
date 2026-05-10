@@ -108,8 +108,9 @@ def main():
     parser.add_argument("--config",     required=True)
     parser.add_argument("--input",      required=True, help="hair 이미지 파일 또는 디렉토리")
     parser.add_argument("--matte_dir",  required=True, help="GT matte 디렉토리 (또는 SHS/BiSeNet 출력)")
-    parser.add_argument("--output_dir", default="outputs/inverse_head/")
-    parser.add_argument("--size",       type=int, default=512)
+    parser.add_argument("--output_dir",  default="outputs/inverse_head/")
+    parser.add_argument("--size",        type=int, default=512)
+    parser.add_argument("--max_images",  type=int, default=None)
     args = parser.parse_args()
 
     cfg        = load_config(args.config)
@@ -165,6 +166,8 @@ def main():
         files = [input_path]
 
     matte_dir = Path(args.matte_dir)
+    if args.max_images:
+        files = files[:args.max_images]
 
     print(f"{len(files)} image(s) → {output_dir}")
     for fpath in files:
