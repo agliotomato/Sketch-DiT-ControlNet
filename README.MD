@@ -18,19 +18,9 @@
         ▼
 S2M-Net (SketchHairSalon, GAN) ──→ matte (soft alpha)
         │
-        ├── [S2I Sketch + matte] ──→ GAN (S2I-Net, ~100M)        ──→ hair patch (GAN)
+        ├── [S2I Sketch + matte] ──→ GAN (S2I-Net, ~100M)   ──→ hair patch (GAN)
         │
-        └── [S2I Sketch + matte] ──→ DiT ControlNet (Ours)       ──→ hair patch (DiT)
-                                                                          │
-                                                               composite.py
-                                                               hair × matte + face × (1 − matte)
-                                                               + Gaussian feathering
-                                                                          │
-                                                               inpaint_boundary.py
-                                                               boundary ring (dilate-erode) inpainting
-                                                               SD2 inpaint, strength=0.45
-                                                                          │
-                                                                Final Composite Image
+        └── [S2I Sketch + matte] ──→ DiT ControlNet (Ours)  ──→ hair patch (DiT)
 ```
 
 ---
