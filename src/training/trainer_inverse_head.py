@@ -658,43 +658,24 @@ class InverseHeadTrainer:
         null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=dtype)
         null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=dtype)
 
-        def make_inject_hook(sample):
-            def _h(_module, _inputs, outputs):
-                enc_hs, img_hs = outputs
-                s = sample.to(dtype=img_hs.dtype)
-                n = s.shape[1]
-                if img_hs.shape[1] == n:
-                    return (enc_hs, img_hs + s)
-                return (enc_hs, torch.cat([img_hs[:, :n] + s, img_hs[:, n:]], dim=1))
-            return _h
+        # hook + checkpoint(use_reentrant=False) 조합은 backward 재연산 시 hook이 없어
+        # CheckpointError를 유발한다. block_controlnet_hidden_states 네이티브 파라미터를
+        # 사용하고 block_samples를 checkpoint 입력으로 직접 전달해 회피한다.
+        def _tx_fwd(latent, enc, pool, t_, *blocks):
+            return self.transformer(
+                hidden_states=latent,
+                encoder_hidden_states=enc,
+                pooled_projections=pool,
+                timestep=t_,
+                block_controlnet_hidden_states=list(blocks),
+                return_dict=False,
+            )[0]
 
-        n_inject = min(len(block_samples), len(self.transformer.transformer_blocks))
-        hooks = []
-        try:
-            for i in range(n_inject):
-                hooks.append(
-                    self.transformer.transformer_blocks[i].register_forward_hook(
-                        make_inject_hook(block_samples[i])
-                    )
-                )
-
-            def _tx_fwd(latent, enc, pool, t_):
-                return self.transformer(
-                    hidden_states=latent,
-                    encoder_hidden_states=enc,
-                    pooled_projections=pool,
-                    timestep=t_,
-                    return_dict=False,
-                )[0]
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                v_pred = checkpoint(
-                    _tx_fwd, x_t, null_enc, null_p, t,
-                    use_reentrant=False,
-                )
-        finally:
-            for hk in hooks:
-                hk.remove()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            v_pred = checkpoint(
+                _tx_fwd, x_t, null_enc, null_p, t, *block_samples,
+                use_reentrant=False,
+            )
 
         fm_loss = F.mse_loss(v_pred.float(), v_target.float()) * self.w_fm_forward
         self.accelerator.backward(fm_loss)
