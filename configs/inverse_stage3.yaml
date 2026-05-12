@@ -1,20 +1,24 @@
-# Stage 3: Bidirectional partial joint training
-# - Back blocks (12-23) shared backbone — updated jointly by FM loss + inverse supervised loss
-# - Inverse LoRA (front blocks 0-11) — updated by inverse supervised loss only (frozen during FM step)
-# - Cycle loss enabled after cycle_start epochs
+# Stage 3: Cycle-consistent bidirectional joint training (Option B)
+# - Alternating mini-batch per step:
+#     odd  step  → Forward FM batch : ControlNet update only (inverse frozen)
+#     even step  → Inverse batch    : Inverse module update + ControlNet update via cycle
+# - Cycle loss active from cycle_start epoch
+# - Regression monitor: val_loss_fwd logged every eval_every epochs
 # Resume from Stage 2 checkpoint.
 base: configs/inverse_head.yaml
 
 stage: 3
 bidirectional: true
+controlnet_trainable: true   # Option B: unfreeze ControlNet
+controlnet_lr: 5.0e-6        # ~10x lower than inverse LR (regression 방지)
 use_gt_matte: true
-w_fm_forward: 0.05
+w_fm_forward: 0.1            # was 0.05 — stronger forward signal for CN
 
 training:
   epochs: 50
-  resume: checkpoints/inverse_stage2/best.pth
+  resume: checkpoints/inverse_stage2/final.pth
   cycle_start: 10
-  learning_rate: 5.0e-5    # lower than stage 2 — refinement phase
+  learning_rate: 5.0e-5
   loss_weights:
     structure: 1.0
     color: 0.5
