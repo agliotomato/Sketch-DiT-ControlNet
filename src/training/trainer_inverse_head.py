@@ -11,11 +11,14 @@ Loss schedule (Stage 2, bidirectional=False):
   Phase 2 (epoch >= cycle_start):
     Every step → supervised + cycle (feature MSE + image LPIPS)
 
-Loss schedule (Stage 3, bidirectional=True):
-  Every step → bidirectional partial joint training:
-    loss_inv: inverse supervised [+ cycle if phase2]  → inverse LoRA + back_blocks
-    loss_fm:  forward FM (LoRA frozen)                → back_blocks only
-    loss = loss_inv + loss_fm, single backward + optimizer step
+Loss schedule (Stage 3, bidirectional=True, controlnet_trainable=True — Option B):
+  Alternating per global_step:
+    even step → "inverse batch":
+        supervised [+ cycle if phase2] → inverse params + ControlNet (via cycle)
+    odd  step → "forward batch":
+        FM loss (inverse frozen)       → ControlNet only
+
+  Regression monitor: _validate_forward() logs val_loss_fwd every eval_every epochs.
 """
 
 from __future__ import annotations
@@ -79,9 +82,11 @@ class InverseHeadTrainer:
         self.w_lpips          = tcfg["loss_weights"].get("lpips_cycle", 0.05)
         self.cycle_start      = tcfg.get("cycle_start", 9999)
         self.use_gt_matte     = config.get("use_gt_matte", False)
-        self.bidirectional    = config.get("bidirectional", False)
-        self.w_fm_forward     = config.get("w_fm_forward", 0.1)
-        if (self.w_cycle > 0 or self.w_lpips > 0) and Path(controlnet_ckpt).exists():
+        self.bidirectional        = config.get("bidirectional", False)
+        self.controlnet_trainable = config.get("controlnet_trainable", False)
+        self.w_fm_forward         = config.get("w_fm_forward", 0.1)
+        if (self.w_cycle > 0 or self.w_lpips > 0 or self.controlnet_trainable) \
+                and Path(controlnet_ckpt).exists():
             fwd_cn = HairControlNet(
                 model_id=model_id, vae=self.vae,
                 num_layers=config["model"].get("num_controlnet_layers", 12),
@@ -89,9 +94,12 @@ class InverseHeadTrainer:
             )
             ckpt = torch.load(controlnet_ckpt, map_location="cpu", weights_only=True)
             fwd_cn.load_state_dict(ckpt["controlnet"])
-            fwd_cn.eval()
-            for p in fwd_cn.parameters():
-                p.requires_grad_(False)
+            if self.controlnet_trainable:
+                fwd_cn.train()                          # Option B: trainable
+            else:
+                fwd_cn.eval()
+                for p in fwd_cn.parameters():
+                    p.requires_grad_(False)             # Option A / Stage 2: frozen
             self.forward_controlnet = fwd_cn
 
         # --- Null embeddings (reuse from forward ControlNet if available) ---
@@ -181,6 +189,19 @@ class InverseHeadTrainer:
             self.optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-6,
         )
 
+        # --- ControlNet optimizer (Option B only) ---
+        self.optimizer_cn    = None
+        self.lr_scheduler_cn = None
+        if self.controlnet_trainable and self.forward_controlnet is not None:
+            cn_lr = config.get("controlnet_lr", 5e-6)
+            self.optimizer_cn = AdamW(
+                [p for p in self.forward_controlnet.parameters() if p.requires_grad],
+                lr=cn_lr, betas=(0.9, 0.999), weight_decay=1e-2,
+            )
+            self.lr_scheduler_cn = CosineAnnealingLR(
+                self.optimizer_cn, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-8,
+            )
+
         # --- Loss ---
         lw = tcfg.get("loss_weights", {})
         self.loss_fn = InversionLoss(
@@ -193,21 +214,32 @@ class InverseHeadTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Accelerate prepare ---
-        (
-            self.model,
-            self.optimizer,
-            self.train_loader,
-            self.val_loader,
-            self.lr_scheduler,
-        ) = self.accelerator.prepare(
-            self.model, self.optimizer,
-            self.train_loader, self.val_loader,
-            self.lr_scheduler,
-        )
+        if self.controlnet_trainable and self.forward_controlnet is not None:
+            (
+                self.model, self.optimizer, self.optimizer_cn,
+                self.forward_controlnet,
+                self.train_loader, self.val_loader,
+                self.lr_scheduler, self.lr_scheduler_cn,
+            ) = self.accelerator.prepare(
+                self.model, self.optimizer, self.optimizer_cn,
+                self.forward_controlnet,
+                self.train_loader, self.val_loader,
+                self.lr_scheduler, self.lr_scheduler_cn,
+            )
+        else:
+            (
+                self.model, self.optimizer,
+                self.train_loader, self.val_loader,
+                self.lr_scheduler,
+            ) = self.accelerator.prepare(
+                self.model, self.optimizer,
+                self.train_loader, self.val_loader,
+                self.lr_scheduler,
+            )
         device = self.accelerator.device
         self.vae         = self.vae.to(device)
         self.transformer = self.transformer.to(device)
-        if self.forward_controlnet is not None:
+        if self.forward_controlnet is not None and not self.controlnet_trainable:
             self.forward_controlnet = self.forward_controlnet.to(device)
         if self.lpips_fn is not None:
             self.lpips_fn = self.lpips_fn.to(device)
@@ -244,7 +276,27 @@ class InverseHeadTrainer:
 
     def _setup_stage(self, config: dict) -> None:
         stage = config.get("stage", 2)
-        self.accelerator.print(f"[Stage {stage}] inverse LoRA (front blocks) + shared back_blocks setup complete.")
+        mode  = "Option B (CN trainable)" if self.controlnet_trainable else "Option A (CN frozen)"
+        self.accelerator.print(f"[Stage {stage}] {mode} — inverse LoRA + shared back_blocks ready.")
+
+    def _freeze_inverse_params(self) -> None:
+        """Forward FM step 중 inverse module 전체 freeze (Option B)."""
+        inv = self.accelerator.unwrap_model(self.model)
+        inv.feature_extractor.freeze_lora()
+        for p in inv.feature_extractor.back_blocks.parameters():
+            p.requires_grad_(False)
+        for p in inv.stroke_decoder.parameters():
+            p.requires_grad_(False)
+        inv.feature_extractor.agg_weights.requires_grad_(False)
+
+    def _unfreeze_inverse_params(self) -> None:
+        inv = self.accelerator.unwrap_model(self.model)
+        inv.feature_extractor.unfreeze_lora()
+        for p in inv.feature_extractor.back_blocks.parameters():
+            p.requires_grad_(True)
+        for p in inv.stroke_decoder.parameters():
+            p.requires_grad_(True)
+        inv.feature_extractor.agg_weights.requires_grad_(True)
 
     def train(self):
         tcfg       = self.cfg["training"]
@@ -271,12 +323,61 @@ class InverseHeadTrainer:
             )
 
             for batch in progress:
-                self.optimizer.zero_grad()
 
-                if self.bidirectional:
-                    # Bidirectional partial joint training:
-                    #   loss_inv: inverse LoRA + back_blocks receive gradient
-                    #   loss_fm:  back_blocks only (LoRA frozen inside _forward_fm_step)
+                if self.bidirectional and self.controlnet_trainable:
+                    # ── Option B: alternating mini-batch ──────────────────────
+                    # even step: inverse batch (supervised [+cycle] → inv + CN)
+                    # odd  step: forward batch (FM → CN only, inverse frozen)
+                    is_fwd_step = (self.global_step % 2 == 1)
+
+                    if is_fwd_step:
+                        # Forward FM: CN update only
+                        self._freeze_inverse_params()
+                        self.optimizer_cn.zero_grad()
+                        loss_fm, log_fm = self._forward_fm_step(batch, update_optimizer=False)
+                        if self.cfg["training"].get("gradient_clip"):
+                            cn_params = [p for p in self.accelerator.unwrap_model(
+                                self.forward_controlnet).parameters() if p.requires_grad]
+                            self.accelerator.clip_grad_norm_(cn_params, self.cfg["training"]["gradient_clip"])
+                        self.optimizer_cn.step()
+                        self._unfreeze_inverse_params()
+                        loss    = loss_fm
+                        log_dict = {
+                            "loss_fm_forward": log_fm.get("loss_fm_forward", 0.0),
+                            "loss_total":      log_fm["loss_total"],
+                            "step_type":       4.0,   # forward-only step
+                        }
+                    else:
+                        # Inverse + cycle: both inv and CN update
+                        self.optimizer.zero_grad()
+                        self.optimizer_cn.zero_grad()
+                        loss_sup, log_sup = self._supervised_step(batch, update_optimizer=False)
+                        if phase2:
+                            loss_cyc, log_cyc = self._cycle_step(batch, update_optimizer=False)
+                        else:
+                            loss_cyc = torch.tensor(0.0, device=self.accelerator.device)
+                            log_cyc  = {"loss_cycle_feat": 0.0, "loss_cycle_lpips": 0.0, "loss_total": 0.0}
+                        if self.cfg["training"].get("gradient_clip"):
+                            self.accelerator.clip_grad_norm_(
+                                [p for p in self.model.parameters() if p.requires_grad],
+                                self.cfg["training"]["gradient_clip"],
+                            )
+                        self.optimizer.step()
+                        self.optimizer_cn.step()
+                        loss = loss_sup + loss_cyc
+                        log_dict = {
+                            "loss_structure":   log_sup.get("loss_structure", 0.0),
+                            "loss_color":       log_sup.get("loss_color", 0.0),
+                            "loss_tv":          log_sup.get("loss_tv", 0.0),
+                            "loss_cycle_feat":  log_cyc.get("loss_cycle_feat", 0.0),
+                            "loss_cycle_lpips": log_cyc.get("loss_cycle_lpips", 0.0),
+                            "loss_total":       log_sup["loss_total"] + log_cyc["loss_total"],
+                            "step_type":        3.0,
+                        }
+
+                elif self.bidirectional:
+                    # ── Original bidirectional (Option A / back_blocks only) ──
+                    self.optimizer.zero_grad()
                     loss_sup, log_sup = self._supervised_step(batch, update_optimizer=False)
 
                     if phase2:
@@ -335,11 +436,14 @@ class InverseHeadTrainer:
                 if self.global_step < self.warmup_steps:
                     lr_scale = min(1.0, (self.global_step + 1) / max(self.warmup_steps, 1))
                     for pg in self.optimizer.param_groups:
-                        # Each group has its own _base_lr (main vs back_blocks at lower LR).
-                        # CosineAnnealingLR will continue from these once warmup ends.
                         pg["lr"] = pg["_base_lr"] * lr_scale
+                    if self.optimizer_cn is not None:
+                        for pg in self.optimizer_cn.param_groups:
+                            pg["lr"] = pg["lr"] * lr_scale
                 else:
                     self.lr_scheduler.step()
+                    if self.lr_scheduler_cn is not None:
+                        self.lr_scheduler_cn.step()
 
                 self.global_step += 1
                 progress.set_postfix({k: f"{v:.4f}" for k, v in log_dict.items()})
@@ -350,8 +454,15 @@ class InverseHeadTrainer:
 
             if (epoch + 1) % eval_every == 0:
                 val_loss = self._validate()
-                self.accelerator.print(f"Val loss: {val_loss:.4f}")
-                self.accelerator.log({"val_loss": val_loss, "epoch": epoch + 1}, step=self.global_step)
+                self.accelerator.print(f"Val loss (inv): {val_loss:.4f}")
+                log_eval = {"val_loss": val_loss, "epoch": epoch + 1}
+
+                if self.controlnet_trainable:
+                    fwd_loss = self._validate_forward()
+                    self.accelerator.print(f"Val loss (fwd): {fwd_loss:.4f}  ← regression monitor")
+                    log_eval["val_loss_fwd"] = fwd_loss
+
+                self.accelerator.log(log_eval, step=self.global_step)
 
                 # Save BEFORE image logging — logging crashes must not lose checkpoint
                 if val_loss < self.best_val_loss:
@@ -533,11 +644,16 @@ class InverseHeadTrainer:
         x_t   = (1 - t.view(B, 1, 1, 1)) * hair_latent + t.view(B, 1, 1, 1) * noise
         v_target = (noise - hair_latent).detach()
 
-        # ControlNet conditioning (frozen, no grad)
-        with torch.no_grad():
+        # ControlNet conditioning — trainable(Option B): grad 허용, frozen: no_grad
+        if self.controlnet_trainable:
             block_samples = self.forward_controlnet._get_features_impl(
-                sketch_gt.float(), matte_gt.float(), enable_grad=False,
+                sketch_gt.float(), matte_gt.float(), enable_grad=True,
             )
+        else:
+            with torch.no_grad():
+                block_samples = self.forward_controlnet._get_features_impl(
+                    sketch_gt.float(), matte_gt.float(), enable_grad=False,
+                )
 
         null_enc = self._null_enc_hs.expand(B, -1, -1).to(device=device, dtype=dtype)
         null_p   = self._null_pooled.expand(B, -1).to(device=device, dtype=dtype)
@@ -726,6 +842,50 @@ class InverseHeadTrainer:
             total += log["loss_total"]
             n += 1
 
+        self.model.train()
+        return total / max(n, 1)
+
+    @torch.no_grad()
+    def _validate_forward(self) -> float:
+        """Forward regression monitor: ControlNet FM loss on val set."""
+        if self.forward_controlnet is None:
+            return 0.0
+        cn = self.accelerator.unwrap_model(self.forward_controlnet)
+        cn.eval()
+        device, dtype = self.accelerator.device, torch.bfloat16
+        total, n = 0.0, 0
+
+        for batch in self.val_loader:
+            sketch_gt = batch["sketch"].to(device, dtype=dtype)
+            matte_gt  = batch["matte"].to(device, dtype=dtype)
+            hair      = batch["img"].to(device, dtype=dtype)
+            B = hair.shape[0]
+
+            hair_latent = self.vae.encode(hair)
+            t       = torch.rand(B, device=device, dtype=dtype)
+            noise   = torch.randn_like(hair_latent)
+            x_t     = (1 - t.view(B, 1, 1, 1)) * hair_latent + t.view(B, 1, 1, 1) * noise
+            v_target = (noise - hair_latent).detach()
+
+            block_samples, null_enc_hs, null_pooled = cn(
+                noisy_latent=x_t,
+                sketch=sketch_gt.float(),
+                matte=matte_gt.float(),
+                sigmas=t,
+            )
+            v_pred = self.transformer(
+                hidden_states=x_t,
+                encoder_hidden_states=null_enc_hs.to(dtype=dtype),
+                pooled_projections=null_pooled.to(dtype=dtype),
+                timestep=t,
+                block_controlnet_hidden_states=[s.to(dtype=dtype) for s in block_samples],
+                return_dict=False,
+            )[0]
+            total += F.mse_loss(v_pred.float(), v_target.float()).item()
+            n += 1
+
+        if self.controlnet_trainable:
+            self.accelerator.unwrap_model(self.forward_controlnet).train()
         return total / max(n, 1)
 
     @torch.no_grad()
@@ -856,6 +1016,18 @@ class InverseHeadTrainer:
         }
         torch.save(ckpt, self.output_dir / filename)
         self.accelerator.print(f"Saved: {self.output_dir / filename}")
+
+        # Option B: save ControlNet separately for regression rollback
+        if self.controlnet_trainable and self.forward_controlnet is not None:
+            cn_ckpt = {
+                "controlnet": self.accelerator.unwrap_model(self.forward_controlnet).state_dict(),
+                "optimizer_cn":    self.optimizer_cn.state_dict(),
+                "lr_scheduler_cn": self.lr_scheduler_cn.state_dict(),
+                "epoch":           epoch + 1,
+            }
+            cn_filename = filename.replace(".pth", "_controlnet.pth")
+            torch.save(cn_ckpt, self.output_dir / cn_filename)
+            self.accelerator.print(f"Saved: {self.output_dir / cn_filename}")
 
 
 def _flatten(cfg: dict, prefix: str = "") -> dict:
