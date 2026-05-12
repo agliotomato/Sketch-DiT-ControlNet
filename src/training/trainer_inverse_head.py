@@ -95,11 +95,14 @@ class InverseHeadTrainer:
             ckpt = torch.load(controlnet_ckpt, map_location="cpu", weights_only=True)
             fwd_cn.load_state_dict(ckpt["controlnet"])
             if self.controlnet_trainable:
-                fwd_cn.train()                          # Option B: trainable
+                fwd_cn.train()
+                # forward 시 activation 메모리 절감 (CN 12 blocks 재연산)
+                if hasattr(fwd_cn.controlnet, "enable_gradient_checkpointing"):
+                    fwd_cn.controlnet.enable_gradient_checkpointing()
             else:
                 fwd_cn.eval()
                 for p in fwd_cn.parameters():
-                    p.requires_grad_(False)             # Option A / Stage 2: frozen
+                    p.requires_grad_(False)
             self.forward_controlnet = fwd_cn
 
         # --- Null embeddings (reuse from forward ControlNet if available) ---

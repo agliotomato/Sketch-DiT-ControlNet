@@ -16,6 +16,7 @@ w_fm_forward: 0.1            # was 0.05 — stronger forward signal for CN
 
 training:
   epochs: 50
+  batch_size: 2      # CN trainable → activation 2배 → bs 절반
   resume: checkpoints/inverse_stage2/final.pth
   cycle_start: 40    # epoch 30 resume → 10 epoch warm-up 후 cycle 시작
   learning_rate: 5.0e-5
