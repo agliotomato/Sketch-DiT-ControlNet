@@ -44,7 +44,9 @@ class LoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        A = self.lora_A.to(x.dtype)
+        B = self.lora_B.to(x.dtype)
+        return self.base(x) + (x @ A.T @ B.T) * self.scale
 
 
 class DiTFeatureExtractor(nn.Module):
