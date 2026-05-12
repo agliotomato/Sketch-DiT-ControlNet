@@ -1,17 +1,10 @@
-# Stage 2: Inverse warm-start
-# - Forward LoRA frozen (loaded from old inverse checkpoint if available)
-# - Inverse LoRA initialized from Forward LoRA, then trains supervised
-# - FPN decoder stabilizes on sketch-only task
-# - No bidirectional, no cycle loss
+# Stage 2: Inverse warm-start (supervised only)
+# - Single inverse LoRA (blocks 0-11) + shared back_blocks (12-23) + FPN decoder
+# - No cycle loss, no bidirectional — pure supervised phase
 # - Matte from GT (external at inference: SHS / BiSeNet)
 base: configs/inverse_head.yaml
 
 stage: 2
-init_inverse_from_forward: true
-
-# Optional: load old inverse experiment LoRA weights as forward LoRA init basis
-# forward_lora_init_from: checkpoints/inverse_head/best.pth
-
 bidirectional: false
 use_gt_matte: true
 
@@ -22,6 +15,8 @@ training:
     structure: 1.0
     color: 0.5
     tv: 0.01
+    cycle: 0.0        # disable cycle → ControlNet not loaded (saves ~4GB VRAM)
+    lpips_cycle: 0.0
 
 checkpointing:
   output_dir: checkpoints/inverse_stage2/

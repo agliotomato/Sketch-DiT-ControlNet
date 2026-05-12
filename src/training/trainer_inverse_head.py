@@ -2,23 +2,20 @@
 InverseHeadTrainer: Hair→Sketch via partially-unfrozen DiT + trainable FPN mask decoder.
 
 Backbone:
-  blocks 0-11:  frozen base + LoRA (to_q/k/v, rank-8)
-  blocks 12-23: fully unfrozen (all parameters trainable, lower LR via backbone_lr_scale)
+  blocks 0-11:  frozen base + inverse LoRA (to_q/k/v, rank-8)
+  blocks 12-23: shared backbone — fully unfrozen, lower LR via backbone_lr_scale
 
-Loss schedule:
+Loss schedule (Stage 2, bidirectional=False):
   Phase 1 (epoch < cycle_start):
-    Every step → supervised (structure BCE + color L1 + matte BCE+Dice+L1 + TV)
-
+    Every step → supervised (structure BCE + color L1 + TV)
   Phase 2 (epoch >= cycle_start):
-    Even global_step → supervised step (same as phase 1)
-    Odd  global_step → cycle step:
-        - feature MSE: MSE(forward_cn.features(sketch_pred), forward_cn.features(sketch_gt))
-        - image LPIPS: LPIPS(vae.decode(dit(encode_for_grad(sketch_pred))), hair_orig)
+    Every step → supervised + cycle (feature MSE + image LPIPS)
 
-Mini-batch alternating design:
-  Two separate zero_grad/backward/step pairs per alternation period.
-  The feature cycle and LPIPS cycle both use enable_grad=True paths so that
-  gradients reach the inverse model parameters through frozen forward models.
+Loss schedule (Stage 3, bidirectional=True):
+  Every step → bidirectional partial joint training:
+    loss_inv: inverse supervised [+ cycle if phase2]  → inverse LoRA + back_blocks
+    loss_fm:  forward FM (LoRA frozen)                → back_blocks only
+    loss = loss_inv + loss_fm, single backward + optimizer step
 """
 
 from __future__ import annotations
@@ -83,7 +80,6 @@ class InverseHeadTrainer:
         self.cycle_start      = tcfg.get("cycle_start", 9999)
         self.use_gt_matte     = config.get("use_gt_matte", False)
         self.bidirectional    = config.get("bidirectional", False)
-        self.bidir_batch_mode = config.get("bidir_batch_mode", "alternating")
         self.w_fm_forward     = config.get("w_fm_forward", 0.1)
         if (self.w_cycle > 0 or self.w_lpips > 0) and Path(controlnet_ckpt).exists():
             fwd_cn = HairControlNet(
@@ -247,46 +243,8 @@ class InverseHeadTrainer:
         )
 
     def _setup_stage(self, config: dict) -> None:
-        """Stage-specific model setup (called after checkpoint restore)."""
         stage = config.get("stage", 2)
-        feat  = self.accelerator.unwrap_model(self.model).feature_extractor
-
-        if stage == 2:
-            # Forward LoRA frozen; inverse LoRA trains from scratch (or warm-started).
-            feat.freeze_forward_lora()
-
-            # Optional: load old LoRA weights into forward adapter as better init base.
-            old_ckpt = config.get("forward_lora_init_from")
-            if old_ckpt and Path(old_ckpt).exists():
-                self._load_old_lora_as_forward(old_ckpt)
-                self.accelerator.print(f"[Stage 2] Loaded old LoRA → forward adapter from {old_ckpt}")
-
-            # Warm-start inverse LoRA from forward LoRA.
-            if config.get("init_inverse_from_forward", True):
-                feat.init_inverse_from_forward()
-                self.accelerator.print("[Stage 2] Inverse LoRA initialized from Forward LoRA.")
-
-        elif stage == 3:
-            # Both LoRAs trainable; gradient routing via mode switching.
-            feat.unfreeze_forward_lora()
-            self.accelerator.print("[Stage 3] Both LoRAs unfrozen for bidirectional alternating.")
-
-        feat.set_lora_mode("inverse")   # default mode
-
-    def _load_old_lora_as_forward(self, path: str) -> None:
-        """Load a Stage-1/Exp-2 checkpoint's LoRALinear weights into fwd_A/fwd_B."""
-        ckpt      = torch.load(path, map_location="cpu", weights_only=True)
-        old_state = ckpt.get("model", ckpt)
-        feat      = self.accelerator.unwrap_model(self.model).feature_extractor
-        for i, mod in enumerate(feat.lora_modules):
-            a_key = f"feature_extractor.lora_modules.{i}.lora_A"
-            b_key = f"feature_extractor.lora_modules.{i}.lora_B"
-            if a_key in old_state:
-                mod.fwd_A.data.copy_(old_state[a_key].to(mod.fwd_A.device))
-                mod.fwd_B.data.copy_(old_state[b_key].to(mod.fwd_B.device))
-
-    def _set_lora_mode(self, mode: str) -> None:
-        self.accelerator.unwrap_model(self.model).feature_extractor.set_lora_mode(mode)
+        self.accelerator.print(f"[Stage {stage}] inverse LoRA (front blocks) + shared back_blocks setup complete.")
 
     def train(self):
         tcfg       = self.cfg["training"]
@@ -313,17 +271,42 @@ class InverseHeadTrainer:
             )
 
             for batch in progress:
-                # Bidirectional alternating: odd steps → forward FM (back_blocks only)
-                #                            even steps → inverse (supervised [+ cycle])
-                is_fwd_step = self.bidirectional and (self.global_step % 2 == 1)
+                self.optimizer.zero_grad()
 
-                if is_fwd_step:
-                    loss, log_dict = self._forward_fm_step(batch)
+                if self.bidirectional:
+                    # Bidirectional partial joint training:
+                    #   loss_inv: inverse LoRA + back_blocks receive gradient
+                    #   loss_fm:  back_blocks only (LoRA frozen inside _forward_fm_step)
+                    loss_sup, log_sup = self._supervised_step(batch, update_optimizer=False)
+
+                    if phase2:
+                        loss_cyc, log_cyc = self._cycle_step(batch, update_optimizer=False)
+                    else:
+                        loss_cyc = torch.tensor(0.0, device=self.accelerator.device)
+                        log_cyc  = {"loss_cycle_feat": 0.0, "loss_cycle_lpips": 0.0}
+
+                    loss_fm, log_fm = self._forward_fm_step(batch, update_optimizer=False)
+
+                    if self.cfg["training"].get("gradient_clip"):
+                        self.accelerator.clip_grad_norm_(
+                            [p for p in self.model.parameters() if p.requires_grad],
+                            self.cfg["training"]["gradient_clip"],
+                        )
+                    self.optimizer.step()
+
+                    loss = loss_sup + loss_cyc + loss_fm
+                    log_dict = {
+                        "loss_structure":   log_sup.get("loss_structure", 0.0),
+                        "loss_color":       log_sup.get("loss_color", 0.0),
+                        "loss_tv":          log_sup.get("loss_tv", 0.0),
+                        "loss_cycle_feat":  log_cyc.get("loss_cycle_feat", 0.0),
+                        "loss_cycle_lpips": log_cyc.get("loss_cycle_lpips", 0.0),
+                        "loss_fm_forward":  log_fm.get("loss_fm_forward", 0.0),
+                        "loss_total":       log_sup["loss_total"] + loss_cyc.item() + log_fm["loss_total"],
+                        "step_type":        3.0,
+                    }
 
                 elif phase2:
-                    # Phase 2: supervised + cycle joint (even steps)
-                    self.optimizer.zero_grad()
-
                     loss_sup, log_sup = self._supervised_step(batch, update_optimizer=False)
                     loss_cyc, log_cyc = self._cycle_step(batch, update_optimizer=False)
 
@@ -339,11 +322,11 @@ class InverseHeadTrainer:
                         **log_cyc,
                         "loss_structure": log_sup.get("loss_structure", 0.0),
                         "loss_color":     log_sup.get("loss_color", 0.0),
-                        "loss_matte":     log_sup.get("loss_matte", 0.0),
                         "loss_tv":        log_sup.get("loss_tv", 0.0),
                         "loss_total":     log_sup["loss_total"] + log_cyc["loss_total"],
                         "step_type":      2.0,
                     }
+
                 else:
                     loss, log_dict = self._supervised_step(batch)
 
@@ -390,8 +373,6 @@ class InverseHeadTrainer:
 
     def _supervised_step(self, batch: dict, update_optimizer: bool = True) -> tuple[torch.Tensor, dict]:
         """Supervised loss only: structure BCE + color L1 + TV."""
-        self._set_lora_mode("inverse")
-
         device = self.accelerator.device
         dtype  = torch.bfloat16
 
@@ -518,13 +499,16 @@ class InverseHeadTrainer:
     def _forward_fm_step(self, batch: dict, update_optimizer: bool = True) -> tuple[torch.Tensor, dict]:
         """Forward flow matching step: sketch_gt + matte_gt → hair (rectified flow).
 
-        Forward LoRA (Stage 3) + back_blocks receive gradients.
-        Inverse LoRA and FPN decoders are not in this path.
+        Only back_blocks receive gradients — inverse LoRA is frozen during this step.
+        ControlNet injection handles front block conditioning (same as v4).
         Requires forward_controlnet to be available.
         """
-        self._set_lora_mode("forward")
+        # Freeze inverse LoRA: only back_blocks update from FM loss
+        feat = self.accelerator.unwrap_model(self.model).feature_extractor
+        feat.freeze_lora()
 
         if self.forward_controlnet is None:
+            feat.unfreeze_lora()
             return torch.tensor(0.0, device=self.accelerator.device), {
                 "loss_fm_forward": 0.0, "loss_total": 0.0, "step_type": 3.0,
             }
@@ -607,6 +591,9 @@ class InverseHeadTrainer:
                 )
             self.optimizer.step()
 
+        # Restore inverse LoRA gradients for next supervised step
+        feat.unfreeze_lora()
+
         log = {
             "loss_fm_forward": fm_loss.item() / max(self.w_fm_forward, 1e-8),
             "loss_total":      fm_loss.item(),
@@ -621,43 +608,23 @@ class InverseHeadTrainer:
         hair_image:  torch.Tensor,   # (B, 3, 512, 512) float32 in [0, 1]
     ) -> torch.Tensor:
         """
-        TRUE round-trip cycle (matches original design intent in hair2sketch_head.md):
+        Round-trip cycle:
 
-            sketch_pred + matte_pred
-              → forward_controlnet → block_samples (ControlNet residuals)
-
-            sketch_pred → vae.encode_for_grad → sketch_latent (DiT input)
-
-            DiT(sketch_latent, σ=0, null_cond, controlnet_block_samples=block_samples)
-              → pred_hair_latent (single-step approximation of x0 prediction)
-
+            sketch_pred + matte_gt → forward_controlnet → block_samples
+            sketch_pred → vae.encode_for_grad → sketch_latent
+            DiT(sketch_latent, σ=1, null_cond, block_samples injected)
+              → v_pred → pred_hair_latent = sketch_latent - v_pred
             vae.decode(pred_hair_latent) → hair_recon
+            loss = LPIPS(hair_recon * matte_gt, hair_orig * matte_gt)
 
-            loss = LPIPS(hair_recon, hair_orig)
-
-        Why use matte_pred (not matte_gt):
-          The whole point of cycle is to enable semi-supervised learning on
-          unpaired hair images (no matte_gt available there). Using matte_pred
-          here keeps the path identical between paired and unpaired cases.
-
-        How ControlNet injection works (hook-based, version-agnostic):
-          SD3ControlNetModel produces N block_samples (one per ControlNet layer).
-          Each is added to the IMAGE hidden_states of the corresponding transformer
-          block AFTER its forward pass. We register a forward_hook on each block
-          that adds the residual; hooks are removed in finally to avoid leaks.
-
-        Gradient chain (all paths intentional):
+        Gradient chain:
           LPIPS → hair_recon → vae.decode → pred_hair_latent
                 → DiT (back_blocks 12-23 receive grads)
-                → block_samples → forward_CN (frozen, grads flow through)
-                                → matte_cnn (frozen) → matte_pred → matte_decoder ✓
-                                → vae.encode_for_grad → sketch_pred → stroke_decoder ✓
-                                                                    → feature_extractor ✓
-                → sketch_latent → vae.encode_for_grad → sketch_pred → ... ✓
+                → sketch_latent → vae.encode_for_grad → sketch_pred
+                                                       → stroke_decoder ✓
+                                                       → feature_extractor ✓
 
-        autocast(bf16) is required: self.transformer is invoked directly here
-        (not via self.model wrapped by accelerator). LoRA fp32 × bf16 input
-        would error without autocast.
+        autocast(bf16) required: transformer called directly, not via accelerator-wrapped model.
         """
         B      = sketch_pred.shape[0]
         device = sketch_pred.device

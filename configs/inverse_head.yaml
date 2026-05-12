@@ -1,14 +1,15 @@
 # Inverse Head: DiT Feature Extraction + FPN Mask Decoder
 #
 # Data flow:
-#   hair_image → frozen VAE encoder → frozen DiT (+ LoRA) → {early, mid, late} features
-#   features → FPNMaskDecoder → stroke_mask + matte_pred
-#   hair * matte → patch_color_sample(stroke_mask) → sketch_pred
+#   hair_image → frozen VAE encoder → frozen DiT (+ inverse LoRA) → {early, mid, late} features
+#   features → FPNMaskDecoder → stroke_mask
+#   hair * matte_external → patch_color_sample(stroke_mask) → sketch_pred
 #
 # No image generation decoder. No VAE decoder output.
+# Matte provided externally (GT during training, SHS/BiSeNet at inference).
 # Two-phase training:
-#   Phase 1 (epoch 0~cycle_start): supervised (structure + color + matte + TV)
-#   Phase 2 (epoch cycle_start~): + cycle loss w=0.01 via frozen forward ControlNet
+#   Phase 1 (epoch 0~cycle_start): supervised (structure BCE + color L1 + TV)
+#   Phase 2 (epoch cycle_start~): + cycle loss via frozen forward ControlNet
 
 base: configs/base.yaml
 
@@ -35,10 +36,9 @@ training:
   loss_weights:
     structure: 1.0      # BCE: stroke_mask vs GT
     color: 0.5          # L1 stroke-weighted: sketch_pred vs sketch_GT
-    matte: 2.0          # BCE + L1 + Dice: matte_pred vs matte_GT
     tv: 0.01            # Total Variation: stroke mask smoothness
     cycle: 0.01         # Phase 2: forward ControlNet feature MSE
-    lpips_cycle: 0.05   # Phase 2: TRUE round-trip LPIPS via forward_CN + DiT(CN-injected)
+    lpips_cycle: 0.05   # Phase 2: round-trip LPIPS via forward_CN + DiT(CN-injected)
 
 # Cycle step memory split: cycle is heavier than supervised (forward_CN + 2nd DiT pass + VGG)
 # Splits cycle batch into N micro-batches with gradient accumulation. supervised step uses full bs.

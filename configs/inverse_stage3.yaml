@@ -1,14 +1,12 @@
-# Stage 3: Bidirectional alternating refinement
-# - Forward LoRA unfrozen (gets gradient from forward FM steps)
-# - Inverse LoRA gets gradient from inverse supervised steps
-# - Back blocks (12-23) shared, updated by both (alternating)
+# Stage 3: Bidirectional partial joint training
+# - Back blocks (12-23) shared backbone — updated jointly by FM loss + inverse supervised loss
+# - Inverse LoRA (front blocks 0-11) — updated by inverse supervised loss only (frozen during FM step)
 # - Cycle loss enabled after cycle_start epochs
 # Resume from Stage 2 checkpoint.
 base: configs/inverse_head.yaml
 
 stage: 3
 bidirectional: true
-bidir_batch_mode: "alternating"
 use_gt_matte: true
 w_fm_forward: 0.05
 

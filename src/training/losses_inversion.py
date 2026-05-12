@@ -1,13 +1,12 @@
 """
-Inversion Adapter Loss Functions.
+Inverse Head Loss Functions.
 
-Phase A (direct supervision):
+Supervised (Phase 1):
   L_structure = BCE(stroke_mask_pred, stroke_mask_GT)
   L_color     = L1(sketch_pred, sketch_GT) * stroke_mask_GT  (stroke 영역만)
-  L_matte     = BCE(matte_pred, matte_GT) + L1(matte_pred, matte_GT)
 
-Phase B (+ feature cycle consistency, phase_b_start epoch 이후 추가):
-  L_feature   = mean MSE(block_pred[i], block_gt[i]) over 12 blocks
+Optional feature cycle (Phase 2, block_pred/block_gt provided):
+  L_feature   = mean MSE(block_pred[i], block_gt[i]) over N blocks
 """
 
 from __future__ import annotations
