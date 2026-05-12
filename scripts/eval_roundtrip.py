@@ -33,9 +33,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import lpips as lpips_lib
 from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from src.data.dataset import HairRegionDataset
 from src.models.controlnet_sd35 import HairControlNet
@@ -179,6 +178,42 @@ def run_sampling(
 
 
 # ---------------------------------------------------------------------------
+# Metrics (no torchmetrics dependency)
+# ---------------------------------------------------------------------------
+
+def _psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
+    mse = torch.mean((pred.float() - target.float()) ** 2).item()
+    if mse == 0:
+        return float("inf")
+    return 10 * np.log10(max_val ** 2 / mse)
+
+
+def _ssim(pred: torch.Tensor, target: torch.Tensor,
+          window_size: int = 11, sigma: float = 1.5) -> float:
+    import torch.nn.functional as F
+    pred   = pred.float()
+    target = target.float()
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    # Gaussian kernel
+    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    kernel = (g.unsqueeze(1) * g.unsqueeze(0)).unsqueeze(0).unsqueeze(0)  # (1,1,W,W)
+    C = pred.shape[1]
+    kernel = kernel.expand(C, 1, window_size, window_size).to(pred.device)
+    pad = window_size // 2
+    mu1  = F.conv2d(pred,   kernel, padding=pad, groups=C)
+    mu2  = F.conv2d(target, kernel, padding=pad, groups=C)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1 ** 2, mu2 ** 2, mu1 * mu2
+    sig1 = F.conv2d(pred   * pred,   kernel, padding=pad, groups=C) - mu1_sq
+    sig2 = F.conv2d(target * target, kernel, padding=pad, groups=C) - mu2_sq
+    sig12 = F.conv2d(pred  * target, kernel, padding=pad, groups=C) - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sig12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sig1 + sig2 + C2))
+    return ssim_map.mean().item()
+
+
+# ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 
@@ -231,9 +266,9 @@ def main():
     transformer = transformer.eval()
 
     # ---- Metrics ----
-    lpips_fn = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(device)
-    ssim_fn  = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    psnr_fn  = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    lpips_fn = lpips_lib.LPIPS(net="vgg").to(device).eval()
+    for p in lpips_fn.parameters():
+        p.requires_grad_(False)
 
     from torch.utils.data import ConcatDataset
     output_dir = Path(args.output_dir)
@@ -252,20 +287,20 @@ def main():
         hair_orig  = data["img"].unsqueeze(0).to(device, dtype=torch.float32)   # (1,3,512,512)
         matte_gt   = data["matte"].unsqueeze(0)
 
-        # Step 1: hair → sketch_pred + matte_pred
+        # Step 1: hair → sketch_pred  (matte provided externally: GT matte)
+        matte_in = matte_gt.to(device=device, dtype=dtype)
         with torch.no_grad():
-            sketch_pred, matte_pred, _ = inv_model(hair_orig.to(dtype=dtype))
+            sketch_pred, _ = inv_model(hair_orig.to(dtype=dtype), matte_in)
         sketch_pred = sketch_pred.float().clamp(0, 1)
-        matte_pred  = matte_pred.float().clamp(0, 1)
 
-        # Step 2: sketch_pred → hair_recon
+        # Step 2: sketch_pred + matte_gt → hair_recon
         hair_recon = run_sampling(
             controlnet=controlnet,
             transformer=transformer,
             vae=fwd_vae,
             scheduler=scheduler,
             sketch=sketch_pred,
-            matte=matte_pred,
+            matte=matte_in.float(),
             num_steps=args.num_steps,
             device=device,
             dtype=dtype,
@@ -277,21 +312,20 @@ def main():
         orig_masked    = hair_orig_cpu * matte_gt_cpu
         recon_masked   = hair_recon * matte_gt_cpu
 
-        # LPIPS expects [-1, 1]
-        orig_11  = orig_masked.to(device)  * 2 - 1
-        recon_11 = recon_masked.to(device) * 2 - 1
+        orig_11  = (orig_masked  * 2 - 1).to(device)
+        recon_11 = (recon_masked * 2 - 1).to(device)
 
         with torch.no_grad():
             l = lpips_fn(recon_11, orig_11).item()
-            s = ssim_fn(recon_masked.to(device), orig_masked.to(device)).item()
-            p = psnr_fn(recon_masked.to(device), orig_masked.to(device)).item()
+            s = _ssim(recon_masked.to(device), orig_masked.to(device))
+            p = _psnr(recon_masked.to(device), orig_masked.to(device))
 
         lpips_scores.append(l)
         ssim_scores.append(s)
         psnr_scores.append(p)
 
-        # Save panel: hair_orig | sketch_pred | matte_pred | hair_recon
-        panel = make_panel(hair_orig_cpu, sketch_pred.cpu(), matte_pred.cpu(), hair_recon)
+        # Save panel: hair_orig | sketch_pred | matte_gt | hair_recon
+        panel = make_panel(hair_orig_cpu, sketch_pred.cpu(), matte_gt_cpu, hair_recon)
         Image.fromarray(panel).save(output_dir / f"{idx:04d}_panel.png")
 
     # ---- Summary ----
