@@ -38,7 +38,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
 
 from src.data.dataset import HairRegionDataset
 from src.models.controlnet_sd35 import HairControlNet
-from src.models.inverse_head import HairToSketchDiT
+from src.models.semi_spatial_net import SemiSpatialNet
 from src.models.vae_wrapper import VAEWrapper
 
 
@@ -93,19 +93,20 @@ def build_backbone(cfg: dict, device, dtype):
     return vae, transformer
 
 
-def build_inverse_model(cfg: dict, vae, transformer, device, dtype) -> HairToSketchDiT:
+def build_inverse_model(cfg: dict, vae, transformer, device, dtype) -> SemiSpatialNet:
     lora_cfg    = cfg.get("lora", {})
     null_enc_hs = torch.zeros(1, 333, 4096, dtype=dtype, device=device)
     null_pooled = torch.zeros(1, 2048,      dtype=dtype, device=device)
 
-    model = HairToSketchDiT(
+    model = SemiSpatialNet(
         transformer=transformer,
         vae=vae,
         null_enc_hs=null_enc_hs,
         null_pooled=null_pooled,
         lora_rank=lora_cfg.get("rank", 8),
         lora_alpha=lora_cfg.get("alpha", 8.0),
-        grid_size=cfg.get("grid_size", 16),
+        d_model=cfg.get("d_model", 512),
+        nhead=cfg.get("nhead", 8),
     )
     return model
 
