@@ -19,7 +19,7 @@ nhead: 8       # attention heads (d_head = 64)
 
 training:
   epochs: 30
-  batch_size: 6
+  batch_size: 8
   learning_rate: 1.0e-4
   cycle_start: 9999  # supervised-only; set lower to enable cycle loss later
   loss_weights:
