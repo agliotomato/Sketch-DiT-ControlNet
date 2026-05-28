@@ -7,6 +7,12 @@ build/
 .venv/
 venv/
 *.egg
+inverse_semi_spatial/
+inverse_head2/
+stage2_roundtrip_result/
+stage3_epoch40_roundtrip_result/
+
+
 
 
 # Dataset (too large for git)

@@ -1,0 +1,27 @@
+# Ablation: Joint Training
+# Train on braid + unbraid simultaneously (4000 total: 3000 + 1000).
+# No curriculum — directly learn both styles from scratch.
+# Compare against curriculum training (unbraid→braid) to justify curriculum design.
+
+base: configs/base.yaml
+
+training:
+  phase: pretrain
+  dataset: both                     # ConcatDataset: unbraid_train + braid_train
+
+  epochs: 40
+  batch_size: 2
+  gradient_accumulation_steps: 4   # effective batch 8
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+
+  loss_weights:
+    flow: 1.0
+    lpips: 0.1
+    lpips_warmup_frac: 0.3
+    edge: 0.02                      # light edge loss (braid 비율 1/4이므로 약하게)
+
+checkpointing:
+  output_dir: checkpoints/ablation_unified/
+  eval_every: 10
+  save_every: 20

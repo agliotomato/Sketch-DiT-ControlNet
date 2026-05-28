@@ -8,9 +8,9 @@ training:
   dataset: braid            # loads braid_{train,test}
   resume_from: checkpoints/phase1_unbraid/epoch_40.pth
 
-  epochs: 50
-  batch_size: 4             # 40GB GPU 기준 (gradient_accumulation_steps: 2로 effective batch 8 유지)
-  gradient_accumulation_steps: 2
+  epochs: 40
+  batch_size: 2             # LPIPS OOM 방지 (gradient_accumulation_steps: 4로 effective batch 8 유지)
+  gradient_accumulation_steps: 4
   learning_rate: 2.0e-5
   warmup_steps: 100
 

@@ -1,0 +1,26 @@
+# Ablation: Braid-only Training
+# Trains directly on braid WITHOUT unbraid pretraining.
+# Baseline to demonstrate curriculum training necessity.
+
+base: configs/base.yaml
+
+training:
+  phase: pretrain
+  dataset: braid            # loads braid_{train,test}
+
+  epochs: 40
+  batch_size: 2             # LPIPS OOM 방지 (gradient_accumulation_steps: 4로 effective batch 8 유지)
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+
+  loss_weights:
+    flow: 1.0
+    lpips: 0.1
+    lpips_warmup_frac: 0.3
+    edge: 0.05
+
+checkpointing:
+  output_dir: checkpoints/ablation_braid_only/
+  eval_every: 5
+  save_every: 10
