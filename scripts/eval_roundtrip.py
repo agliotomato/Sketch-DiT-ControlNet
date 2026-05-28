@@ -325,9 +325,9 @@ def main():
         ssim_scores.append(s)
         psnr_scores.append(p)
 
-        # Save panel: hair_orig | sketch_pred | matte_gt | hair_recon
-        panel = make_panel(hair_orig_cpu, sketch_pred.cpu(), matte_gt_cpu, hair_recon)
-        Image.fromarray(panel).save(output_dir / f"{idx:04d}_panel.png")
+        # Save hair_recon only (4th column)
+        recon_np = (hair_recon.squeeze(0).permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+        Image.fromarray(recon_np).save(output_dir / f"{idx:04d}.png")
 
     # ---- Summary ----
     metrics = {
