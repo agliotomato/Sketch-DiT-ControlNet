@@ -1,25 +1,19 @@
 """
-Inverse Head 추론: Hair Image → Sketch + Matte.
+Inverse Head 추론: Hair Image → Sketch (SemiSpatialNet).
 
-HairToSketchDiT (DiT feature extraction + FPN mask decoder) 로드 후
-hair 이미지에서 sketch_pred + matte_pred를 저장한다.
+색은 원본 hair 이미지에서 직접 가져옴:
+  sketch_pred = hair_image × matte × stroke_mask
 
 Usage:
   python scripts/infer_inverse_head.py \
-    --checkpoint checkpoints/inverse_head/best.pth \
-    --config     configs/inverse_head.yaml \
-    --input      dataset/braid/img/test/sample.png \
-    --output_dir outputs/inverse_head/
-
-  # 디렉토리 일괄 처리
-  python scripts/infer_inverse_head.py \
-    --checkpoint checkpoints/inverse_head/best.pth \
-    --config     configs/inverse_head.yaml \
+    --checkpoint checkpoints/inverse_semi_spatial/best.pth \
+    --config     configs/inverse_semi_spatial.yaml \
     --input      dataset/braid/img/test/ \
-    --output_dir outputs/inverse_head/
+    --matte_dir  dataset/braid/matte/test/ \
+    --output_dir outputs/inverse_semi_spatial/
 
-출력: {stem}_sketch.png, {stem}_matte.png
-→ scripts/infer.py 또는 scripts/infer_custom.py의 --sketch, --matte 입력으로 연결 (round-trip 검증)
+출력: {stem}_sketch.png
+→ eval_roundtrip.py 또는 forward 추론의 --sketch 입력으로 연결
 """
 
 import argparse
@@ -36,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from diffusers import SD3Transformer2DModel
 
-from src.models.inverse_head import HairToSketchDiT
+from src.models.semi_spatial_net import SemiSpatialNet
 from src.models.vae_wrapper import VAEWrapper
 
 
@@ -85,17 +79,27 @@ def load_matte(path: Path, size: int = 512) -> torch.Tensor:
 
 @torch.no_grad()
 def infer(
-    model: HairToSketchDiT,
+    model: SemiSpatialNet,
     hair_image: torch.Tensor,
     matte: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    binarize_threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Returns sketch_pred (1, 3, 512, 512) float in [0, 1]."""
-    hair  = hair_image.to(device=device, dtype=dtype)
-    matte = matte.to(device=device, dtype=dtype)
-    sketch_pred, _ = model(hair, matte)
-    return sketch_pred.float().clamp(0, 1)
+    """Returns sketch_pred (1, 3, 512, 512) float in [0, 1].
+    stroke_mask is binarized to produce clean hard-brush strokes.
+    """
+    hair = hair_image.to(device=device, dtype=dtype)
+    mat  = matte.to(device=device, dtype=dtype)
+
+    sketch_pred, stroke_mask = model(hair, mat)
+    sketch_pred = sketch_pred.float()
+    stroke_mask = stroke_mask.float()
+
+    # sketch_pred = decoder_rgb * soft_mask  →  recover decoder_rgb, apply hard mask
+    stroke_hard  = (stroke_mask > binarize_threshold).float()
+    decoder_rgb  = sketch_pred / stroke_mask.clamp(min=1e-6)
+    return (decoder_rgb * stroke_hard).clamp(0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +123,6 @@ def main():
     model_id   = cfg["model"]["model_id"]
     local_only = cfg.get("local_files_only", False)
     lora_cfg   = cfg.get("lora", {})
-    grid_size  = cfg.get("grid_size", 16)
 
     print("Loading VAE...")
     vae = VAEWrapper.from_pretrained(
@@ -136,19 +139,19 @@ def main():
     for p in transformer.parameters():
         p.requires_grad_(False)
 
-    # null conditioning: zero tensors (model weights carry the real null embeddings via LoRA)
     null_enc_hs = torch.zeros(1, 333, 4096, dtype=dtype, device=device)
     null_pooled = torch.zeros(1, 2048,      dtype=dtype, device=device)
 
-    print("Building HairToSketchDiT...")
-    model = HairToSketchDiT(
+    print("Building SemiSpatialNet...")
+    model = SemiSpatialNet(
         transformer=transformer,
         vae=vae,
         null_enc_hs=null_enc_hs,
         null_pooled=null_pooled,
         lora_rank=lora_cfg.get("rank", 8),
         lora_alpha=lora_cfg.get("alpha", 8.0),
-        grid_size=grid_size,
+        d_model=cfg.get("d_model", 512),
+        nhead=cfg.get("nhead", 8),
     )
 
     print(f"Loading checkpoint: {args.checkpoint}")

@@ -10,11 +10,14 @@ use_gt_matte: true
 
 training:
   epochs: 30
+  batch_size: 8      # GH200 96GB, supervised only (CN/cycle 없음)
   cycle_start: 9999
   loss_weights:
     structure: 1.0
+    dice: 1.0
     color: 0.5
-    tv: 0.01
+    tv: 0.0
+    sharp: 0.5        # binarization: mask*(1-mask) → pushes sigmoid toward 0 or 1
     cycle: 0.0        # disable cycle → ControlNet not loaded (saves ~4GB VRAM)
     lpips_cycle: 0.0
 

@@ -71,10 +71,10 @@ def load_config(path: str) -> dict:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def build_inverse_model(cfg: dict, device, dtype) -> HairToSketchDiT:
+def build_backbone(cfg: dict, device, dtype):
+    """DiT + VAE 한 번만 로드 — inverse/forward 공유."""
     model_id   = cfg["model"]["model_id"]
     local_only = cfg.get("local_files_only", False)
-    lora_cfg   = cfg.get("lora", {})
 
     vae = VAEWrapper.from_pretrained(
         model_id=model_id, torch_dtype=dtype, local_files_only=local_only,
@@ -85,10 +85,16 @@ def build_inverse_model(cfg: dict, device, dtype) -> HairToSketchDiT:
     transformer = SD3Transformer2DModel.from_pretrained(
         model_id, subfolder="transformer",
         torch_dtype=dtype, local_files_only=local_only,
+        low_cpu_mem_usage=True,
     ).to(device).eval()
     for p in transformer.parameters():
         p.requires_grad_(False)
 
+    return vae, transformer
+
+
+def build_inverse_model(cfg: dict, vae, transformer, device, dtype) -> HairToSketchDiT:
+    lora_cfg    = cfg.get("lora", {})
     null_enc_hs = torch.zeros(1, 333, 4096, dtype=dtype, device=device)
     null_pooled = torch.zeros(1, 2048,      dtype=dtype, device=device)
 
@@ -101,21 +107,12 @@ def build_inverse_model(cfg: dict, device, dtype) -> HairToSketchDiT:
         lora_alpha=lora_cfg.get("alpha", 8.0),
         grid_size=cfg.get("grid_size", 16),
     )
-    return model, vae
+    return model
 
 
-def build_forward_model(cfg: dict, device, dtype):
+def build_controlnet(cfg: dict, vae, device, dtype):
     model_id   = cfg["model"]["model_id"]
     local_only = cfg.get("local_files_only", False)
-
-    vae = VAEWrapper.from_pretrained(
-        model_id=model_id, torch_dtype=dtype, local_files_only=local_only,
-    ).to(device).eval()
-
-    transformer = SD3Transformer2DModel.from_pretrained(
-        model_id, subfolder="transformer",
-        torch_dtype=dtype, local_files_only=local_only,
-    ).to(device).eval()
 
     controlnet = HairControlNet(
         model_id=model_id,
@@ -128,7 +125,7 @@ def build_forward_model(cfg: dict, device, dtype):
         model_id, subfolder="scheduler", local_files_only=local_only,
     )
 
-    return vae, transformer, controlnet, scheduler
+    return controlnet, scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -250,20 +247,23 @@ def main():
     inv_cfg = load_config(args.inverse_config)
     fwd_cfg = load_config(args.forward_config)
 
+    # ---- Shared backbone: DiT + VAE 한 번만 로드 ----
+    print("Loading shared DiT + VAE...")
+    vae, transformer = build_backbone(inv_cfg, device, dtype)
+
     # ---- Inverse model ----
     print("Building inverse model...")
-    inv_model, inv_vae = build_inverse_model(inv_cfg, device, dtype)
+    inv_model = build_inverse_model(inv_cfg, vae, transformer, device, dtype)
     inv_ckpt = torch.load(args.inverse_ckpt, map_location="cpu", weights_only=True)
     inv_model.load_state_dict(inv_ckpt["model"])
     inv_model = inv_model.to(device=device, dtype=dtype).eval()
 
-    # ---- Forward model ----
-    print("Building forward model...")
-    fwd_vae, transformer, controlnet, scheduler = build_forward_model(fwd_cfg, device, dtype)
+    # ---- ControlNet + scheduler ----
+    print("Building ControlNet...")
+    controlnet, scheduler = build_controlnet(fwd_cfg, vae, device, dtype)
     fwd_ckpt = torch.load(args.forward_ckpt, map_location="cpu", weights_only=True)
     controlnet.load_state_dict(fwd_ckpt["controlnet"])
     controlnet = controlnet.to(device=device, dtype=dtype).eval()
-    transformer = transformer.eval()
 
     # ---- Metrics ----
     lpips_fn = lpips_lib.LPIPS(net="vgg").to(device).eval()
@@ -297,7 +297,7 @@ def main():
         hair_recon = run_sampling(
             controlnet=controlnet,
             transformer=transformer,
-            vae=fwd_vae,
+            vae=vae,
             scheduler=scheduler,
             sketch=sketch_pred,
             matte=matte_in.float(),

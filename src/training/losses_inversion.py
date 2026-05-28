@@ -22,11 +22,13 @@ class InversionLoss(nn.Module):
         w_structure: float = 1.0,
         w_color: float = 0.5,
         w_feature: float = 0.1,
+        w_dice: float = 1.0,
     ):
         super().__init__()
         self.w_structure = w_structure
         self.w_color     = w_color
         self.w_feature   = w_feature
+        self.w_dice      = w_dice
 
     def forward(
         self,
@@ -46,12 +48,19 @@ class InversionLoss(nn.Module):
 
         l_structure = F.binary_cross_entropy(stroke_mask_pred, stroke_mask_gt)
 
+        # Dice loss: binary segmentation sharpness
+        pred_flat = stroke_mask_pred.view(-1)
+        gt_flat   = stroke_mask_gt.view(-1)
+        intersection = (pred_flat * gt_flat).sum()
+        l_dice = 1.0 - (2.0 * intersection + 1.0) / (pred_flat.sum() + gt_flat.sum() + 1.0)
+
         n_stroke = stroke_mask_gt.sum().clamp(min=1)
         l_color  = (F.l1_loss(sketch_pred, sketch_gt, reduction="none") * stroke_mask_gt).sum() / n_stroke
 
-        total = self.w_structure * l_structure + self.w_color * l_color
+        total = self.w_structure * l_structure + self.w_dice * l_dice + self.w_color * l_color
         log = {
             "loss_structure": l_structure.item(),
+            "loss_dice":      l_dice.item(),
             "loss_color":     l_color.item(),
         }
 

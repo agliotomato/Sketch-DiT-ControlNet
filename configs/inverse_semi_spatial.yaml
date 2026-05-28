@@ -1,0 +1,40 @@
+# SemiSpatialNet: Dual-path inverse model (CNN spatial + DiT semantic)
+# - CNN pixel-space encoder (512→256→128→64) with skip connections
+# - Cross-attention fusion: Q=CNN, K/V=DiT (SD3.5 'late' features)
+# - U-Net decoder: direct 3-ch RGB sketch output (no binary mask + grid color)
+# - Perceptual loss (VGG via LPIPS) prevents L1 regression-to-mean
+#
+# Supervised-only first (cycle_start=9999).
+# Resume from here when adding cycle loss (stage 3 equivalent).
+base: configs/inverse_head.yaml
+
+stage: 2
+bidirectional: false
+controlnet_trainable: false
+use_gt_matte: true
+
+# Cross-attention hyperparams
+d_model: 512   # Q/K/V projection dim
+nhead: 8       # attention heads (d_head = 64)
+
+training:
+  epochs: 30
+  batch_size: 6
+  learning_rate: 1.0e-4
+  cycle_start: 9999  # supervised-only; set lower to enable cycle loss later
+  loss_weights:
+    structure: 1.0    # BCE: stroke_mask auxiliary head
+    dice: 1.0         # Dice: stroke_mask sharpness
+    color: 0.5        # masked L1: sketch_pred vs sketch_gt (stroke 영역)
+    perceptual: 0.1   # VGG perceptual: prevents brownish mean-collapse
+    tv: 0.0           # disabled
+    sharp: 0.05       # pushes stroke_mask toward 0/1 → clean binarization at inference
+    cycle: 0.0        # disabled
+    lpips_cycle: 0.0  # disabled
+
+checkpointing:
+  output_dir: checkpoints/inverse_semi_spatial/
+  eval_every: 2
+  save_every: 5
+
+run_name: inverse_semi_spatial

@@ -38,7 +38,7 @@ from tqdm import tqdm
 from src.data.augmentation import build_augmentation_pipeline
 from src.data.dataset import HairRegionDataset
 from src.models.controlnet_sd35 import HairControlNet
-from src.models.inverse_head import HairToSketchDiT
+from src.models.semi_spatial_net import SemiSpatialNet
 from src.models.vae_wrapper import VAEWrapper
 from src.training.losses_inversion import InversionLoss, tv_loss
 
@@ -116,16 +116,18 @@ class InverseHeadTrainer:
         self._null_enc_hs = null_enc_hs
         self._null_pooled = null_pooled
 
-        # --- Trainable model: LoRA (blocks 0-11) + back_blocks (12-23) + FPN decoders ---
+        # --- Trainable model: CNN encoder + cross-attention + U-Net decoder
+        #     + DiT LoRA (blocks 0-11) + back_blocks (12-23) ---
         lora_cfg = config.get("lora", {})
-        self.model = HairToSketchDiT(
+        self.model = SemiSpatialNet(
             transformer=self.transformer,
             vae=self.vae,
             null_enc_hs=null_enc_hs,
             null_pooled=null_pooled,
             lora_rank=lora_cfg.get("rank", 8),
             lora_alpha=lora_cfg.get("alpha", 8.0),
-            grid_size=config.get("grid_size", 16),
+            d_model=config.get("d_model", 512),
+            nhead=config.get("nhead", 8),
         )
 
         # --- LPIPS metric (frozen VGG network) ---
@@ -210,8 +212,11 @@ class InverseHeadTrainer:
         self.loss_fn = InversionLoss(
             w_structure=lw.get("structure", 1.0),
             w_color=lw.get("color", 0.5),
+            w_dice=lw.get("dice", 1.0),
         )
-        self.w_tv = lw.get("tv", 0.01)
+        self.w_tv         = lw.get("tv",         0.0)
+        self.w_sharp      = lw.get("sharp",      0.0)
+        self.w_perceptual = lw.get("perceptual", 0.0)
 
         self.output_dir = Path(config["checkpointing"]["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +282,20 @@ class InverseHeadTrainer:
             f"Resumed from {resume} (epoch {self.start_epoch}, step {self.global_step})"
         )
 
+        # Also restore ControlNet weights/optimizer when resuming a Stage 3 checkpoint
+        cn_resume = Path(resume).with_name(Path(resume).stem + "_controlnet.pth")
+        if (self.controlnet_trainable and self.forward_controlnet is not None
+                and cn_resume.exists()):
+            cn_ckpt = torch.load(cn_resume, map_location="cpu", weights_only=True)
+            self.accelerator.unwrap_model(self.forward_controlnet).load_state_dict(
+                cn_ckpt["controlnet"]
+            )
+            if "optimizer_cn"    in cn_ckpt and self.optimizer_cn    is not None:
+                self.optimizer_cn.load_state_dict(cn_ckpt["optimizer_cn"])
+            if "lr_scheduler_cn" in cn_ckpt and self.lr_scheduler_cn is not None:
+                self.lr_scheduler_cn.load_state_dict(cn_ckpt["lr_scheduler_cn"])
+            self.accelerator.print(f"Restored ControlNet from {cn_resume}")
+
     def _setup_stage(self, config: dict) -> None:
         stage = config.get("stage", 2)
         mode  = "Option B (CN trainable)" if self.controlnet_trainable else "Option A (CN frozen)"
@@ -288,8 +307,11 @@ class InverseHeadTrainer:
         inv.feature_extractor.freeze_lora()
         for p in inv.feature_extractor.back_blocks.parameters():
             p.requires_grad_(False)
-        for p in inv.stroke_decoder.parameters():
-            p.requires_grad_(False)
+        # Support SemiSpatialNet (.decoder) and legacy HairToSketchDiT (.stroke_decoder)
+        _dec = getattr(inv, "decoder", None) or getattr(inv, "stroke_decoder", None)
+        if _dec is not None:
+            for p in _dec.parameters():
+                p.requires_grad_(False)
         inv.feature_extractor.agg_weights.requires_grad_(False)
 
     def _unfreeze_inverse_params(self) -> None:
@@ -297,8 +319,10 @@ class InverseHeadTrainer:
         inv.feature_extractor.unfreeze_lora()
         for p in inv.feature_extractor.back_blocks.parameters():
             p.requires_grad_(True)
-        for p in inv.stroke_decoder.parameters():
-            p.requires_grad_(True)
+        _dec = getattr(inv, "decoder", None) or getattr(inv, "stroke_decoder", None)
+        if _dec is not None:
+            for p in _dec.parameters():
+                p.requires_grad_(True)
         inv.feature_extractor.agg_weights.requires_grad_(True)
 
     def train(self):
@@ -330,25 +354,42 @@ class InverseHeadTrainer:
                 if self.bidirectional and self.controlnet_trainable:
                     # ── Option B: alternating mini-batch ──────────────────────
                     # even step: inverse batch (supervised [+cycle] → inv + CN)
-                    # odd  step: forward batch (FM → CN only, inverse frozen)
+                    # odd  step: forward batch (FM → back_blocks + CN, LoRA/decoder frozen)
                     is_fwd_step = (self.global_step % 2 == 1)
 
                     if is_fwd_step:
-                        # Forward FM: CN update only
-                        self._freeze_inverse_params()
+                        # Forward FM: back_blocks + CN 모두 업데이트
+                        # LoRA는 _forward_fm_step 내부에서 freeze/unfreeze 처리됨
+                        # stroke_decoder와 agg_weights만 추가 freeze (inverse 전용)
+                        inv = self.accelerator.unwrap_model(self.model)
+                        for p in inv.stroke_decoder.parameters():
+                            p.requires_grad_(False)
+                        inv.feature_extractor.agg_weights.requires_grad_(False)
+
+                        self.optimizer.zero_grad()
                         self.optimizer_cn.zero_grad()
                         loss_fm, log_fm = self._forward_fm_step(batch, update_optimizer=False)
                         if self.cfg["training"].get("gradient_clip"):
+                            grad_clip = self.cfg["training"]["gradient_clip"]
+                            self.accelerator.clip_grad_norm_(
+                                [p for p in self.model.parameters() if p.requires_grad],
+                                grad_clip,
+                            )
                             cn_params = [p for p in self.accelerator.unwrap_model(
                                 self.forward_controlnet).parameters() if p.requires_grad]
-                            self.accelerator.clip_grad_norm_(cn_params, self.cfg["training"]["gradient_clip"])
-                        self.optimizer_cn.step()
-                        self._unfreeze_inverse_params()
-                        loss    = loss_fm
+                            self.accelerator.clip_grad_norm_(cn_params, grad_clip)
+                        self.optimizer.step()     # back_blocks FM gradient 반영
+                        self.optimizer_cn.step()  # CN FM gradient 반영
+
+                        for p in inv.stroke_decoder.parameters():
+                            p.requires_grad_(True)
+                        inv.feature_extractor.agg_weights.requires_grad_(True)
+
+                        loss = loss_fm
                         log_dict = {
                             "loss_fm_forward": log_fm.get("loss_fm_forward", 0.0),
                             "loss_total":      log_fm["loss_total"],
-                            "step_type":       4.0,   # forward-only step
+                            "step_type":       4.0,
                         }
                     else:
                         # Inverse + cycle: both inv and CN update
@@ -506,8 +547,23 @@ class InverseHeadTrainer:
         )
 
         l_tv = tv_loss(stroke_mask.float())
-        loss = loss + self.w_tv * l_tv
+        m = stroke_mask.float()
+        l_sharp = (m * (1.0 - m)).mean()
+        loss = loss + self.w_tv * l_tv + self.w_sharp * l_sharp
         log_dict["loss_tv"]    = l_tv.item()
+        log_dict["loss_sharp"] = l_sharp.item()
+
+        # Perceptual loss (VGG via LPIPS) — prevents L1 regression-to-mean
+        if self.w_perceptual > 0 and self.lpips_fn is not None:
+            pred_11 = sketch_pred.float() * 2.0 - 1.0
+            gt_11   = sketch_gt.float()   * 2.0 - 1.0
+            pred_lp = F.interpolate(pred_11,        size=(256, 256), mode="bilinear", align_corners=False)
+            gt_lp   = F.interpolate(gt_11.detach(), size=(256, 256), mode="bilinear", align_corners=False)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                l_perc = self.lpips_fn(pred_lp, gt_lp).mean()
+            loss = loss + self.w_perceptual * l_perc
+            log_dict["loss_perceptual"] = l_perc.item()
+
         log_dict["loss_total"] = loss.item()
         log_dict["step_type"]  = 0.0
 

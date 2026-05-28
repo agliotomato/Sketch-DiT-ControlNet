@@ -44,3 +44,11 @@ inverse_head/
 round_trips/
 
 SketchHairSalon/
+
+inverse_stage2/
+inverse_stage3/
+
+stage2_check/
+stage2_roundtrip/
+stage3_epoch40/
+stage3_epoch40_roundtrip/
