@@ -10,8 +10,8 @@ training:
   dataset: both                     # ConcatDataset: unbraid_train + braid_train
 
   epochs: 40
-  batch_size: 2
-  gradient_accumulation_steps: 4   # effective batch 8
+  batch_size: 8
+  gradient_accumulation_steps: 1   # effective batch 8
   learning_rate: 1.0e-4
   warmup_steps: 500
 
