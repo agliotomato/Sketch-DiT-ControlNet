@@ -28,7 +28,6 @@ ctrl_cond = cat([sketch_latent + matte_feat, matte_down], dim=1)  # (B, 17, 64, 
 **측정 지표**:
 - Face LPIPS (hair 영역 외 보존도)
 - ArcFace cosine similarity (identity 보존)
-- Boundary LPIPS (경계 품질)
 
 ---
 
@@ -130,3 +129,11 @@ weight = matte_down + outside_weight * (1.0 - matte_down)
 - 실험 A : 5월 30일
 - 실험 B : 5월 31일
 - SOTA 비교 : 5월 30일 ~ 31일
+
+Ablation A
+- matte conditiong 이 약하다면(A1, A2) ControlNet이 hair 영역 토큰 외에도 non-hair 토큰에도 영향을 줄 가능성이 있다고 생각하였습니다. 다른 조건의 matte-conditoing에 따른 영향을 확인하기 위해서 non-hair 영역도 평가지표에 포함시켰습ㅂ니다. 
+
+- matte_conditong 의 타당성을 증명하는 평가는 헤어패치만 평가하려고 계획하였습니다. full-image 생성 원리가 헤어 패치 생성 후 latent space 내에서 헤어와 배경이 합성되기 때문에 생성 능력 평가는 헤어 패치만으로도 충분하다고 판단하였습니다. 그리하여 matte-conditiong 에서는 bounday 관련 평가지표는 제외하였습니다.
+
+Ablation B
+- 넵 알겠습니다
