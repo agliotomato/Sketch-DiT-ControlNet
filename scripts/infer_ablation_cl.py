@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
 
+from src.data.augmentation import StrokeColorSampler
 from src.data.dataset import HairRegionDataset
 from src.models.controlnet_sd35 import HairControlNet
 from src.models.vae_wrapper import VAEWrapper
@@ -153,7 +154,7 @@ def main():
     )
 
     print(f"Dataset: {args.split}  →  {output_dir}")
-    dataset = HairRegionDataset(split=args.split)
+    dataset = HairRegionDataset(split=args.split, augmentation=StrokeColorSampler(p=1.0))
     print(f"총 {len(dataset)}개 샘플")
 
     for idx in tqdm(range(len(dataset)), desc="Generating"):
