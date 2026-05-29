@@ -1,18 +1,17 @@
 """
 Ablation 3: Curriculum Learning evaluation.
 
-Compares 5 training strategies on both unbraid and braid test splits.
-
-Input: raw hair patches (model output, no composite needed).
-  custom_results/ablation_cl/c1_unbraid_only/{split}/{stem}.png
-  custom_results/ablation_cl/c2_braid_only/{split}/{stem}.png
-  custom_results/ablation_cl/c3_joint/{split}/{stem}.png
-  custom_results/ablation_cl/c4_reverse/{split}/{stem}.png
-  custom_results/ablation_cl/c5_ours/{split}/{stem}.png
+Input: raw hair patches saved by infer_ablation_cl.py
+  custom_results/ablation_cl/{tag}/{split}/{stem}.png
 
 GT hair patch: dataset/{split}/img/test/{stem}.png  (matte-masked internally)
 
-Metrics (curriculum 비교 목적 — boundary/identity 제외):
+평가 그룹:
+  unbraid  : C1(Unbraid Only) vs C3(Joint) vs C4(Reverse) vs C5(Ours)
+  braid    : C2(Braid Only)   vs C3(Joint) vs C4(Reverse) vs C5(Ours)
+  combined : C3(Joint) vs C4(Reverse) vs C5(Ours)  — unbraid+braid 합산
+
+Metrics (hair patch only — boundary/identity 제외):
   [1] Sketch Fidelity : Edge IoU, Chamfer Distance, Sketch LPIPS
   [2] Generation      : Hair FID, LPIPS(GT), SSIM(GT), PSNR(GT)
 
@@ -21,9 +20,9 @@ Outputs:
   eval_results/ablation_cl_{split}_per_image.csv
 
 Usage:
-  python scripts/eval_ablation_cl.py --split braid
   python scripts/eval_ablation_cl.py --split unbraid
-  python scripts/eval_ablation_cl.py --split both
+  python scripts/eval_ablation_cl.py --split braid
+  python scripts/eval_ablation_cl.py --split combined
 """
 
 import argparse
@@ -49,12 +48,25 @@ OUT_DIR.mkdir(exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-VARIANTS = [
+# 평가 그룹별 variant 정의
+VARIANTS_UNBRAID = [
     ("c1_unbraid_only", "Unbraid Only"),
-    ("c2_braid_only",   "Braid Only"),
     ("c3_joint",        "Joint"),
     ("c4_reverse",      "Reverse Curriculum"),
     ("c5_ours",         "Ours (Forward)"),
+]
+
+VARIANTS_BRAID = [
+    ("c2_braid_only", "Braid Only"),
+    ("c3_joint",      "Joint"),
+    ("c4_reverse",    "Reverse Curriculum"),
+    ("c5_ours",       "Ours (Forward)"),
+]
+
+VARIANTS_COMBINED = [
+    ("c3_joint",   "Joint"),
+    ("c4_reverse", "Reverse Curriculum"),
+    ("c5_ours",    "Ours (Forward)"),
 ]
 
 METRIC_KEYS = [
@@ -121,8 +133,7 @@ def _ssim_rgb(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Masking helpers
-# Hair patch는 배경이 black이므로 matte bbox crop으로 hair 영역만 잘라서 비교.
+# Masking helpers — GT * matte 및 pred * matte 모두 적용
 # ---------------------------------------------------------------------------
 
 def _bbox_crop(img: np.ndarray, mask: np.ndarray):
@@ -134,7 +145,6 @@ def _bbox_crop(img: np.ndarray, mask: np.ndarray):
 
 
 def _hair_crops(pred: np.ndarray, gt: np.ndarray, matte: np.ndarray):
-    """matte bbox 기준으로 pred/gt crop, 바깥 pixel 0으로 zeroing."""
     hair = matte > 127
     pc, mc = _bbox_crop(pred, hair)
     gc, _  = _bbox_crop(gt,   hair)
@@ -164,10 +174,8 @@ def _canny(img: np.ndarray) -> np.ndarray:
 
 def _edge_iou(pred_e: np.ndarray, sk_e: np.ndarray, matte: np.ndarray) -> float:
     hair  = matte > 127
-    a_m   = pred_e & hair
-    b_m   = sk_e   & hair
-    inter = (a_m & b_m).sum()
-    union = (a_m | b_m).sum()
+    inter = (pred_e & hair & sk_e).sum()
+    union = ((pred_e | sk_e) & hair).sum()
     return float(inter / union) if union > 0 else 0.0
 
 
@@ -201,11 +209,7 @@ def _sketch_lpips(pred: np.ndarray, sketch: np.ndarray, matte: np.ndarray) -> fl
 def _gen_metrics(pred: np.ndarray, gt: np.ndarray, matte: np.ndarray) -> dict:
     pv, gv, pc, gc = _hair_crops(pred, gt, matte)
     lpips_val = compute_lpips(pc, gc) if (pc.shape[0] >= 8 and pc.shape[1] >= 8) else float("nan")
-    return {
-        "psnr":  _psnr(pv, gv),
-        "ssim":  _ssim_rgb(pc, gc),
-        "lpips": lpips_val,
-    }
+    return {"psnr": _psnr(pv, gv), "ssim": _ssim_rgb(pc, gc), "lpips": lpips_val}
 
 
 # ---------------------------------------------------------------------------
@@ -236,20 +240,21 @@ def _compute_fid(real_imgs: list, fake_imgs: list) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Per-split evaluation
+# Core per-split evaluation (재사용 가능한 함수)
 # ---------------------------------------------------------------------------
 
-def evaluate_split(split: str) -> None:
+def _collect_split(split: str, variants: list) -> tuple:
+    """단일 split에 대해 per-image 지표 수집 및 FID 버퍼 반환."""
     gt_img_dir   = ROOT / f"dataset/{split}/img/test"
     gt_matte_dir = ROOT / f"dataset/{split}/matte/test"
     sketch_dir   = ROOT / f"dataset/{split}/sketch/test"
 
     stems = sorted(p.stem for p in gt_img_dir.glob("*.png"))
-    print(f"\n[{split}] GT: {len(stems)}개")
+    print(f"\n  [{split}] {len(stems)}개")
     if len(stems) < 500:
-        print(f"  [WARNING] FID는 500장 이상 권장 (현재 {len(stems)}장)")
+        print(f"  [WARNING] FID는 500장 이상 권장")
 
-    tags    = [tag for tag, _ in VARIANTS]
+    tags    = [tag for tag, _ in variants]
     fid_buf = {tag: {"real": [], "fake": []} for tag in tags}
     rows    = []
 
@@ -261,9 +266,9 @@ def evaluate_split(split: str) -> None:
         hair_mask = matte > 127
         gt_fid    = _fid_crop(gt_img, hair_mask)
         sk_edge   = _canny(sketch)
-        row       = {"stem": stem}
+        row       = {"stem": stem, "_split": split}
 
-        for tag, _ in VARIANTS:
+        for tag, _ in variants:
             pred_path = ROOT / f"custom_results/ablation_cl/{tag}/{split}/{stem}.png"
             if not pred_path.exists():
                 for k in METRIC_KEYS:
@@ -287,8 +292,15 @@ def evaluate_split(split: str) -> None:
 
         rows.append(row)
 
+    return rows, fid_buf
+
+
+def _write_results(split_label: str, rows: list, fid_buf: dict, variants: list) -> None:
+    """지표 집계 후 CSV 저장 및 콘솔 출력."""
+    tags = [tag for tag, _ in variants]
+
     # FID
-    print("  FID 계산 중...")
+    print(f"\n  FID 계산 중 ({split_label})...")
     fid_scores = {}
     for tag in tags:
         real = [x for x in fid_buf[tag]["real"] if x is not None]
@@ -297,43 +309,43 @@ def evaluate_split(split: str) -> None:
         fid_scores[tag] = fid
         print(f"    {tag}: n={len(fake)}, hair_fid={fid:.2f}")
 
-    # per-image CSV
     non_fid_keys = [k for k in METRIC_KEYS if k != "hair_fid"]
-    per_img_path = OUT_DIR / f"ablation_cl_{split}_per_image.csv"
-    fieldnames   = ["stem"] + [f"{tag}_{k}" for tag, _ in VARIANTS for k in non_fid_keys]
+
+    # per-image CSV
+    per_img_path = OUT_DIR / f"ablation_cl_{split_label}_per_image.csv"
+    fieldnames   = ["stem"] + [f"{tag}_{k}" for tag, _ in variants for k in non_fid_keys]
     with open(per_img_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
     # summary CSV
-    summary_path = OUT_DIR / f"ablation_cl_{split}_summary.csv"
+    summary_path = OUT_DIR / f"ablation_cl_{split_label}_summary.csv"
     with open(summary_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["metric"] + [label for _, label in VARIANTS])
+        writer.writerow(["metric"] + [label for _, label in variants])
         for k in non_fid_keys:
             vals = []
-            for tag, _ in VARIANTS:
+            for tag, _ in variants:
                 col = [r[f"{tag}_{k}"] for r in rows if r.get(f"{tag}_{k}") is not None]
                 vals.append(f"{np.mean(col):.4f}" if col else "—")
             writer.writerow([k] + vals)
-        writer.writerow(["hair_fid"] + [f"{fid_scores[tag]:.2f}" for tag, _ in VARIANTS])
+        writer.writerow(["hair_fid"] + [f"{fid_scores[tag]:.2f}" for tag, _ in variants])
 
     print(f"\n  summary   → {summary_path}")
     print(f"  per-image → {per_img_path}")
 
-    # 콘솔 출력
-    col_w = 20
-    header = f"  {'metric':<18}" + "".join(f"{label:>{col_w}}" for _, label in VARIANTS)
+    col_w  = 20
+    header = f"  {'metric':<18}" + "".join(f"{label:>{col_w}}" for _, label in variants)
     print(f"\n{header}")
     print("  " + "-" * len(header))
     for k in non_fid_keys:
         vals = []
-        for tag, _ in VARIANTS:
+        for tag, _ in variants:
             col = [r[f"{tag}_{k}"] for r in rows if r.get(f"{tag}_{k}") is not None]
             vals.append(f"{np.mean(col):.4f}" if col else "—")
         print(f"  {k:<18}" + "".join(f"{v:>{col_w}}" for v in vals))
-    print(f"  {'hair_fid':<18}" + "".join(f"{fid_scores[tag]:>{col_w}.2f}" for tag, _ in VARIANTS))
+    print(f"  {'hair_fid':<18}" + "".join(f"{fid_scores[tag]:>{col_w}.2f}" for tag, _ in variants))
 
 
 # ---------------------------------------------------------------------------
@@ -342,12 +354,33 @@ def evaluate_split(split: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--split", default="both", choices=["unbraid", "braid", "both"])
+    parser.add_argument("--split", default="unbraid",
+                        choices=["unbraid", "braid", "combined"])
     args = parser.parse_args()
 
-    splits = ["unbraid", "braid"] if args.split == "both" else [args.split]
-    for split in splits:
-        evaluate_split(split)
+    if args.split == "unbraid":
+        rows, fid_buf = _collect_split("unbraid", VARIANTS_UNBRAID)
+        _write_results("unbraid", rows, fid_buf, VARIANTS_UNBRAID)
+
+    elif args.split == "braid":
+        rows, fid_buf = _collect_split("braid", VARIANTS_BRAID)
+        _write_results("braid", rows, fid_buf, VARIANTS_BRAID)
+
+    elif args.split == "combined":
+        # unbraid + braid 합산, C3/C4/C5만 평가
+        rows_u, fid_u = _collect_split("unbraid", VARIANTS_COMBINED)
+        rows_b, fid_b = _collect_split("braid",   VARIANTS_COMBINED)
+
+        rows_all = rows_u + rows_b
+
+        # FID 버퍼 합산
+        tags = [tag for tag, _ in VARIANTS_COMBINED]
+        fid_combined = {tag: {
+            "real": fid_u[tag]["real"] + fid_b[tag]["real"],
+            "fake": fid_u[tag]["fake"] + fid_b[tag]["fake"],
+        } for tag in tags}
+
+        _write_results("combined", rows_all, fid_combined, VARIANTS_COMBINED)
 
 
 if __name__ == "__main__":
