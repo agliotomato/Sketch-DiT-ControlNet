@@ -127,6 +127,6 @@ weight = matte_down + outside_weight * (1.0 - matte_down)
 
 계획 
 - 실험 C : 5월 29일
-- 실험 A : 6월 1일
-- 실험 B : 6월 2일
-- SOTA 비교 : 6월 1일 ~ 2일
+- 실험 A : 5월 30일
+- 실험 B : 5월 31일
+- SOTA 비교 : 5월 30일 ~ 31일
