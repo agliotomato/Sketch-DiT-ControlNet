@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
 
-from src.models.controlnet_sd35 import HairControlNet
+from src.models.controlnet_sd35 import HairControlNet, gate_block_samples
 from src.models.vae_wrapper import VAEWrapper
 
 
@@ -104,6 +104,7 @@ def run_sampling(
     num_steps: int,
     device: torch.device,
     dtype: torch.dtype,
+    schedule: str = "none",
 ) -> torch.Tensor:
     scheduler.set_timesteps(num_steps, device=device)
     latents = torch.randn(1, 16, 64, 64, device=device, dtype=dtype)
@@ -119,6 +120,10 @@ def run_sampling(
             sigmas=sigmas_1d,
         )
         block_samples = [s.to(dtype=dtype) for s in block_samples]
+        if schedule != "none":
+            block_samples = gate_block_samples(
+                block_samples, matte.to(device=device, dtype=dtype), schedule
+            )
 
         v_pred = transformer(
             hidden_states=latents,
@@ -172,6 +177,8 @@ def main():
     parser.add_argument("--config",       default="configs/inverse_stage3.yaml")
     parser.add_argument("--num_steps",    type=int, default=20)
     parser.add_argument("--output_dir",   default="outputs/hairpatch/")
+    parser.add_argument("--schedule",     default="none",
+                        choices=["none", "front_only", "all", "back_only"])
     args = parser.parse_args()
 
     cfg    = load_config(args.config)
@@ -232,6 +239,7 @@ def main():
         hair_recon = run_sampling(
             controlnet, transformer, vae, scheduler,
             sketch, matte, args.num_steps, device, dtype,
+            schedule=args.schedule,
         )
 
         out_path = output_dir / f"{stem}_hairpatch.png"

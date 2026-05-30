@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from diffusers import FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
 
 from src.data.dataset import HairRegionDataset
-from src.models.controlnet_sd35 import HairControlNet
+from src.models.controlnet_sd35 import HairControlNet, gate_block_samples
 from src.models.vae_wrapper import VAEWrapper
 
 
@@ -71,6 +71,7 @@ def run_sampling(
     matte: torch.Tensor,    # (1, 1, 512, 512) [0,1]
     num_steps: int,
     device: torch.device,
+    schedule: str = "none",
 ) -> torch.Tensor:
     """Flow matching reverse sampling. Returns (1, 3, 512, 512) in [0, 1]."""
     scheduler.set_timesteps(num_steps, device=device)
@@ -88,6 +89,10 @@ def run_sampling(
             sigmas=sigmas_1d,
         )
         block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
+        if schedule != "none":
+            block_samples = gate_block_samples(
+                block_samples, matte.to(device=device, dtype=torch.bfloat16), schedule
+            )
         null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
         null_pooled   = null_pooled.to(dtype=torch.bfloat16)
 
@@ -147,6 +152,8 @@ def main():
     parser.add_argument("--num_samples", type=int, default=16)
     parser.add_argument("--num_steps",   type=int, default=20)
     parser.add_argument("--output_dir",  default="outputs/infer")
+    parser.add_argument("--schedule",    default="none",
+                        choices=["none", "front_only", "all", "back_only"])
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -207,6 +214,7 @@ def main():
             matte=matte,
             num_steps=args.num_steps,
             device=device,
+            schedule=args.schedule,
         )
 
         gen_cpu  = gen.cpu()

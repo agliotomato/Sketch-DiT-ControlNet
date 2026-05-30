@@ -1,0 +1,8 @@
+metric,Joint,Reverse Curriculum,Ours (Forward)
+edge_iou,0.0613,0.0607,0.0616
+chamfer,5.3523,5.5852,5.6994
+sketch_lpips,0.6742,0.6717,0.6720
+psnr,16.1149,15.5648,16.2746
+ssim,0.6047,0.5969,0.6094
+lpips,0.1928,0.2054,0.1993
+hair_fid,50.67,55.62,53.07

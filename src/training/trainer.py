@@ -47,7 +47,7 @@ from tqdm import tqdm
 from src.data.augmentation import build_augmentation_pipeline
 from src.data.dataset import HairRegionDataset
 from src.data.utils import resize_matte_to_latent
-from src.models.controlnet_sd35 import HairControlNet
+from src.models.controlnet_sd35 import HairControlNet, gate_block_samples
 from src.models.vae_wrapper import VAEWrapper
 from src.training.ema import EMAModel
 from src.training.losses import HairLoss
@@ -84,6 +84,7 @@ class Trainer:
 
         # Inverse task self-distillation
         self.inverse_mode = config["training"].get("mode", "forward") == "inverse"
+        self.schedule     = config["training"].get("schedule", "none")
         self.w_cycle      = config["training"]["loss_weights"].get("cycle", 0.0)
         self.cycle_start  = config["training"].get("cycle_start", 9999)
         self.w_sketch_dec = config["training"]["loss_weights"].get("sketch_decoder", 0.0)
@@ -445,6 +446,8 @@ class Trainer:
                 sigmas=sigmas_1d,
             )
             block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
+            if self.schedule != "none":
+                block_samples = gate_block_samples(block_samples, matte, self.schedule)
             null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
             null_pooled   = null_pooled.to(dtype=torch.bfloat16)
 
@@ -574,6 +577,8 @@ class Trainer:
                 sigmas=sigmas_1d,
             )
             block_samples = [s.to(dtype=torch.bfloat16) for s in block_samples]
+            if self.schedule != "none":
+                block_samples = gate_block_samples(block_samples, matte, self.schedule)
             null_enc_hs   = null_enc_hs.to(dtype=torch.bfloat16)
             null_pooled   = null_pooled.to(dtype=torch.bfloat16)
 

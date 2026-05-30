@@ -12,6 +12,8 @@ training:
   logit_mean: 0.0
   logit_std: 1.0
 
+  schedule: none  # none | front_only | all | back_only
+
   loss_weights:
     flow: 1.0
     lpips: 0.1

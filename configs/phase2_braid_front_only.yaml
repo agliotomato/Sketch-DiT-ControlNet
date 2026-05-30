@@ -1,0 +1,4 @@
+base: configs/phase2_braid.yaml
+
+training:
+  schedule: front_only

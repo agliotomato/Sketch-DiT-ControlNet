@@ -294,3 +294,58 @@ class HairControlNet(nn.Module):
         Cycle self-distillation에서 gradient가 필요하면 _get_features_impl() 직접 호출.
         """
         return self._get_features_impl(sketch, matte)
+
+
+# ---------------------------------------------------------------------------
+# Matte-gated residual helpers
+# ---------------------------------------------------------------------------
+
+def make_matte_tok(matte: torch.Tensor) -> torch.Tensor:
+    """matte (B,1,512,512) → token grid (B,1024,1), SD3 patchify와 동일 순서.
+
+    SD3 patchify: Conv2d(patch=2) → flatten(2).transpose(1,2)
+    512px → latent 64² → patch2 → 32×32 = 1024 tokens
+    """
+    tok = F.interpolate(matte, size=(32, 32), mode="bilinear", align_corners=False)
+    return tok.flatten(2).transpose(1, 2)  # (B, 1024, 1)
+
+
+def gate_block_samples(
+    block_samples: list[torch.Tensor],
+    matte: torch.Tensor,
+    schedule: str,
+    image_tokens: int = 1024,
+    num_transformer_blocks: int = 24,
+) -> list[torch.Tensor]:
+    """schedule에 따라 block_samples의 image token 부분에 soft matte gate 적용.
+
+    block_sample[k]는 transformer blocks 2k, 2k+1에 대응 (interval=2).
+      back_only  : k=6..11 → transformer block 12..23
+      front_only : k=0..5  → transformer block 0..11
+      all        : 전체
+    text token (seq[1024:])은 게이팅하지 않음.
+    """
+    if schedule == "none":
+        return block_samples
+
+    matte_tok = make_matte_tok(matte).to(
+        dtype=block_samples[0].dtype, device=block_samples[0].device
+    )  # (B, 1024, 1)
+    interval = num_transformer_blocks // len(block_samples)  # 24 // 12 = 2
+    half = num_transformer_blocks // 2                       # 12
+
+    gated = []
+    for k, res in enumerate(block_samples):
+        block_idx = k * interval
+        apply = {
+            "front_only": block_idx < half,
+            "all":        True,
+            "back_only":  block_idx >= half,
+        }[schedule]
+        if apply:
+            img = res[:, :image_tokens, :] * matte_tok  # (B, 1024, 1152)
+            txt = res[:, image_tokens:, :]
+            gated.append(torch.cat([img, txt], dim=1))
+        else:
+            gated.append(res)
+    return gated
